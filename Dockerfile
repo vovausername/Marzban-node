@@ -20,6 +20,13 @@ FROM python:$PYTHON_VERSION-slim
 ENV PYTHON_LIB_PATH=/usr/local/lib/python${PYTHON_VERSION%.*}/site-packages
 WORKDIR /code
 
+# ipset + iptables/ip6tables are required by ip_block.py's temporary IP
+# blocking (see docker-compose.yml for the NET_ADMIN/NET_RAW capabilities
+# that let this container actually use them).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ipset iptables \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN rm -rf $PYTHON_LIB_PATH/*
 
 COPY --from=build $PYTHON_LIB_PATH $PYTHON_LIB_PATH

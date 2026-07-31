@@ -1,9 +1,16 @@
 services:
   marzban-node:
-    # build: .
-    image: gozargah/marzban-node:latest
+    build: .
+    # image: gozargah/marzban-node:latest
     restart: always
     network_mode: host
+
+    # NET_ADMIN + NET_RAW let this container manage the ipset/iptables rules
+    # ip_block.py uses for temporary IP blocking. Remove both if you never
+    # intend to use that feature — everything else works without them.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
 
     # env_file: .env
     environment:
@@ -11,6 +18,7 @@ services:
       SSL_KEY_FILE: "/var/lib/marzban-node/ssl_key.pem"
       # SSL_CLIENT_CERT_FILE: "/var/lib/marzban-node/ssl_client_cert.pem"
       # SERVICE_PROTOCOL: "rest"
+      # XRAY_REMOTE_UPDATE_ENABLED: "true"
 
     volumes:
       - /var/lib/marzban-node:/var/lib/marzban-node

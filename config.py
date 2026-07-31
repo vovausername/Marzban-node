@@ -20,3 +20,13 @@ DEBUG = config("DEBUG", cast=bool, default=False)
 SERVICE_PROTOCOL = config('SERVICE_PROTOCOL', cast=str, default='rest')
 
 INBOUNDS = config("INBOUNDS", cast=lambda v: [x.strip() for x in v.split(',')] if v else [], default="")
+
+# Remote Xray binary updates replace the running proxy engine's executable —
+# opt-in only, since a bad version/network blip during the swap is the
+# highest-impact failure mode of anything this node exposes.
+XRAY_REMOTE_UPDATE_ENABLED = config("XRAY_REMOTE_UPDATE_ENABLED", cast=bool, default=False)
+
+# Repo whose GitHub Releases are checked for a newer marzban-node version.
+# Only used to answer "is an update available" — this process never
+# updates itself, since Docker deployments update by pulling a new image.
+UPDATE_CHECK_REPO = config("UPDATE_CHECK_REPO", default="vovausername/Marzban-node")
