@@ -13,7 +13,7 @@ from starlette.websockets import WebSocketDisconnect
 import ip_block
 import version_check
 import xray_updater
-from config import XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH, XRAY_REMOTE_UPDATE_ENABLED
+from config import IP_BLOCK_ENABLED, XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH, XRAY_REMOTE_UPDATE_ENABLED
 from logger import logger
 from xray import XRayConfig, XRayCore
 
@@ -225,6 +225,11 @@ class Service(object):
         minutes: int = Body(embed=True),
     ):
         self.match_session_id(session_id)
+        if not IP_BLOCK_ENABLED:
+            raise HTTPException(
+                status_code=403,
+                detail="IP blocking is disabled. Set IP_BLOCK_ENABLED=true to allow it.",
+            )
         try:
             return ip_block.block_ip(ip, minutes)
         except ip_block.IpBlockError as exc:

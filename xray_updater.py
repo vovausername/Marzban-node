@@ -12,12 +12,20 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
 
 from config import XRAY_EXECUTABLE_PATH
 from logger import logger
+
+# How long to watch a freshly (re)started core before trusting that the new
+# binary/config combination actually stayed up, rather than crashing shortly
+# after XRayCore.start() merely spawned the process. Matches the ~3s window
+# rest_service.py/rpyc_service.py already use when confirming a plain start.
+_START_CONFIRM_SECONDS = 3.0
+_START_POLL_INTERVAL = 0.1
 
 _RELEASES_BASE = "https://github.com/XTLS/Xray-core/releases/download"
 _ARCH_MAP = {
@@ -82,6 +90,21 @@ def _verify_checksum(asset_bytes: bytes, dgst_text: str, asset_name: str) -> Non
         )
 
 
+def _wait_for_stable_start(core) -> bool:
+    """Poll core.started for _START_CONFIRM_SECONDS; return whether it's
+    still running at the end. XRayCore.start() only spawns the process and
+    returns immediately, so this is the only way to notice a new
+    binary/config combination that starts, then dies moments later.
+    """
+    time.sleep(_START_POLL_INTERVAL)
+    deadline = time.time() + _START_CONFIRM_SECONDS
+    while time.time() < deadline:
+        if not core.started:
+            return False
+        time.sleep(_START_POLL_INTERVAL)
+    return core.started
+
+
 def update(version: str, core) -> dict:
     """Download Xray `version`, verify it, atomically replace the binary,
     then restart `core` with its own last-applied config if it was running.
@@ -131,21 +154,25 @@ def update(version: str, core) -> dict:
                 f"Downloaded binary reports unexpected version (wanted {version}): {output.strip()}"
             )
 
-        if was_started:
-            core.stop()
-
-        have_backup = False
+        # Back up the currently-installed binary *before* stopping the core
+        # or touching anything live. If this fails (full disk, permissions,
+        # a stale file occupying backup_path, ...), abort here: the running
+        # core is never even stopped, rather than swapping in an unverified
+        # binary with no way back if it turns out to be broken.
         try:
             shutil.copy2(XRAY_EXECUTABLE_PATH, backup_path)
-            have_backup = True
         except OSError as exc:
-            logger.warning(f"Could not back up current Xray binary before swap: {exc}")
+            raise XrayUpdateError(f"Refusing to update: could not back up current binary: {exc}")
+
+        if was_started:
+            core.stop()
 
         try:
             shutil.move(new_binary_path, XRAY_EXECUTABLE_PATH)
         except OSError as exc:
-            if have_backup:
-                shutil.move(backup_path, XRAY_EXECUTABLE_PATH)
+            shutil.move(backup_path, XRAY_EXECUTABLE_PATH)
+            if was_started:
+                core.start(config)
             raise XrayUpdateError(f"Failed to install new binary: {exc}")
 
     core.version = core.get_version()
@@ -154,17 +181,26 @@ def update(version: str, core) -> dict:
         if config is None:
             logger.warning("Xray binary updated but no known config to restart with; core left stopped")
         else:
+            started_ok = False
             try:
                 core.start(config)
+                started_ok = _wait_for_stable_start(core)
             except Exception as exc:
-                logger.error(f"New Xray {version} failed to start: {exc}; rolling back to {previous_version}")
-                if have_backup:
-                    shutil.move(backup_path, XRAY_EXECUTABLE_PATH)
-                    core.version = core.get_version()
-                    core.start(config)
-                raise XrayUpdateError(f"New version failed to start, rolled back to {previous_version}: {exc}")
+                logger.error(f"New Xray {version} failed to start: {exc}")
 
-    if have_backup and os.path.exists(backup_path):
+            if not started_ok:
+                logger.error(
+                    f"New Xray {version} failed to start or didn't stay running; "
+                    f"rolling back to {previous_version}"
+                )
+                shutil.move(backup_path, XRAY_EXECUTABLE_PATH)
+                core.version = core.get_version()
+                core.start(config)
+                raise XrayUpdateError(
+                    f"New version failed to start or stay running, rolled back to {previous_version}"
+                )
+
+    if os.path.exists(backup_path):
         os.remove(backup_path)
 
     logger.warning(f"Xray updated: {previous_version} -> {core.version}")

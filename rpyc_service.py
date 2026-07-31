@@ -7,7 +7,7 @@ import rpyc
 import ip_block
 import version_check
 import xray_updater
-from config import XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH, XRAY_REMOTE_UPDATE_ENABLED
+from config import IP_BLOCK_ENABLED, XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH, XRAY_REMOTE_UPDATE_ENABLED
 from logger import logger
 from xray import XRayConfig, XRayCore
 
@@ -141,6 +141,10 @@ class XrayService(rpyc.Service):
 
     @rpyc.exposed
     def block_ip(self, ip: str, minutes: int) -> dict:
+        if not IP_BLOCK_ENABLED:
+            raise PermissionError(
+                "IP blocking is disabled. Set IP_BLOCK_ENABLED=true to allow it."
+            )
         try:
             return ip_block.block_ip(ip, minutes)
         except ip_block.IpBlockError as exc:
