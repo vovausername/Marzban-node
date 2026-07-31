@@ -11,7 +11,7 @@ while [[ $# -gt 0 ]]; do
     key="$1"
     
     case $key in
-        install|update|uninstall|up|down|restart|status|logs|core-update|install-script|uninstall-script|edit)
+        install|update|migrate|uninstall|up|down|restart|status|logs|core-update|install-script|uninstall-script|edit)
             COMMAND="$1"
             shift # past argument
         ;;
@@ -264,20 +264,20 @@ install_marzban_node() {
         USE_REST=false
     fi
 
-    # This fork's two opt-in remote-control triggers. Both default to
-    # disabled: XRAY_REMOTE_UPDATE_ENABLED lets the panel replace this
+    # This fork's two remote-control triggers, on by default (matching
+    # config.py): XRAY_REMOTE_UPDATE_ENABLED lets the panel replace this
     # node's Xray binary; IP_BLOCK_ENABLED lets it add temporary
     # ipset/iptables DROP rules on this host (requires NET_ADMIN/NET_RAW,
-    # added to the compose file below only if you say yes here).
-    read -p "Allow the panel to remotely update this node's Xray version? (y/N): " -r allow_xray_update
-    if [[ "$allow_xray_update" =~ ^[Yy]$ ]]; then
+    # added to the compose file below unless you opt out of IP blocking).
+    read -p "Allow the panel to remotely update this node's Xray version? (Y/n): " -r allow_xray_update
+    if [[ -z "$allow_xray_update" || "$allow_xray_update" =~ ^[Yy]$ ]]; then
         XRAY_REMOTE_UPDATE_ENABLED=true
     else
         XRAY_REMOTE_UPDATE_ENABLED=false
     fi
 
-    read -p "Allow the panel to temporarily block IPs on this node's firewall? (y/N): " -r allow_ip_block
-    if [[ "$allow_ip_block" =~ ^[Yy]$ ]]; then
+    read -p "Allow the panel to temporarily block IPs on this node's firewall? (Y/n): " -r allow_ip_block
+    if [[ -z "$allow_ip_block" || "$allow_ip_block" =~ ^[Yy]$ ]]; then
         IP_BLOCK_ENABLED=true
     else
         IP_BLOCK_ENABLED=false
@@ -349,15 +349,26 @@ EOL
 EOL
     fi
 
+    # Written explicitly either way — config.py now defaults both of these
+    # to true, so an omitted line would silently re-enable a feature the
+    # user just said no to above.
     if [[ "$XRAY_REMOTE_UPDATE_ENABLED" = true ]]; then
         cat >> "$COMPOSE_FILE" <<EOL
       XRAY_REMOTE_UPDATE_ENABLED: "true"
+EOL
+    else
+        cat >> "$COMPOSE_FILE" <<EOL
+      XRAY_REMOTE_UPDATE_ENABLED: "false"
 EOL
     fi
 
     if [[ "$IP_BLOCK_ENABLED" = true ]]; then
         cat >> "$COMPOSE_FILE" <<EOL
       IP_BLOCK_ENABLED: "true"
+EOL
+    else
+        cat >> "$COMPOSE_FILE" <<EOL
+      IP_BLOCK_ENABLED: "false"
 EOL
     fi
 
@@ -728,6 +739,58 @@ update_command() {
     colorized_echo blue "Marzban-node updated successfully"
 }
 
+migrate_command() {
+    check_running_as_root
+    if ! is_marzban_node_installed; then
+        colorized_echo red "Marzban-node not installed!"
+        exit 1
+    fi
+
+    detect_compose
+
+    if ! command -v yq &>/dev/null; then
+        echo "yq is not installed. Installing yq..."
+        install_yq
+    fi
+
+    current_image=$(yq eval '.services."marzban-node".image // ""' "$COMPOSE_FILE")
+    colorized_echo blue "Current image: ${current_image:-<none>}"
+
+    if [[ "$current_image" != ghcr.io/vovausername/marzban-node:* ]]; then
+        colorized_echo yellow "Switching to this fork's image: ghcr.io/vovausername/marzban-node:latest"
+        yq eval '.services."marzban-node".image = "ghcr.io/vovausername/marzban-node:latest"' -i "$COMPOSE_FILE"
+    else
+        colorized_echo green "Already on this fork's image."
+    fi
+
+    read -p "Enable this fork's remote-control triggers (remote Xray update + IP blocking)? (Y/n): " -r enable_triggers
+    if [[ -z "$enable_triggers" || "$enable_triggers" =~ ^[Yy]$ ]]; then
+        yq eval '.services."marzban-node".environment.XRAY_REMOTE_UPDATE_ENABLED = "true"' -i "$COMPOSE_FILE"
+        yq eval '.services."marzban-node".environment.IP_BLOCK_ENABLED = "true"' -i "$COMPOSE_FILE"
+        yq eval '.services."marzban-node".cap_add = ["NET_ADMIN", "NET_RAW"]' -i "$COMPOSE_FILE"
+        colorized_echo green "Remote-control triggers enabled (XRAY_REMOTE_UPDATE_ENABLED, IP_BLOCK_ENABLED, NET_ADMIN/NET_RAW)."
+    else
+        yq eval '.services."marzban-node".environment.XRAY_REMOTE_UPDATE_ENABLED = "false"' -i "$COMPOSE_FILE"
+        yq eval '.services."marzban-node".environment.IP_BLOCK_ENABLED = "false"' -i "$COMPOSE_FILE"
+        colorized_echo yellow "Remote-control triggers left disabled. Re-run '$APP_NAME migrate' anytime to turn them on."
+    fi
+
+    client_cert=$(yq eval '.services."marzban-node".environment.SSL_CLIENT_CERT_FILE // ""' "$COMPOSE_FILE")
+    if [ -z "$client_cert" ]; then
+        colorized_echo red "WARNING: SSL_CLIENT_CERT_FILE is not set in $COMPOSE_FILE."
+        colorized_echo red "Running with the remote-control triggers enabled and no client cert lets ANY network peer that can reach this node invoke them. Set SSL_CLIENT_CERT_FILE before relying on this in production."
+    fi
+
+    colorized_echo blue "Pulling the new image..."
+    $COMPOSE -f "$COMPOSE_FILE" -p "$APP_NAME" pull
+
+    colorized_echo blue "Restarting Marzban-node services"
+    down_marzban_node
+    up_marzban_node
+
+    colorized_echo green "Migration to vovausername/Marzban-node complete."
+}
+
 identify_the_operating_system_and_architecture() {
     if [[ "$(uname)" == 'Linux' ]]; then
         case "$(uname -m)" in
@@ -1062,6 +1125,7 @@ usage() {
     colorized_echo yellow "  logs            $(tput sgr0)– Show logs"
     colorized_echo yellow "  install         $(tput sgr0)– Install/reinstall Marzban-node"
     colorized_echo yellow "  update          $(tput sgr0)– Update to latest version"
+    colorized_echo yellow "  migrate         $(tput sgr0)– Switch an existing node to this fork's image + triggers"
     colorized_echo yellow "  uninstall       $(tput sgr0)– Uninstall Marzban-node"
     colorized_echo yellow "  install-script  $(tput sgr0)– Install Marzban-node script"
     colorized_echo yellow "  uninstall-script  $(tput sgr0)– Uninstall Marzban-node script"
@@ -1112,6 +1176,9 @@ case "$COMMAND" in
     ;;
     update)
         update_command
+    ;;
+    migrate)
+        migrate_command
     ;;
     uninstall)
         uninstall_command

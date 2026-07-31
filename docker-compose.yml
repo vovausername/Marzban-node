@@ -18,7 +18,10 @@ services:
       SSL_KEY_FILE: "/var/lib/marzban-node/ssl_key.pem"
       # SSL_CLIENT_CERT_FILE: "/var/lib/marzban-node/ssl_client_cert.pem"
       # SERVICE_PROTOCOL: "rest"
+      # Both remote-control triggers below default to enabled in this fork.
+      # Uncomment and set to "false" to opt out of either one.
       # XRAY_REMOTE_UPDATE_ENABLED: "true"
+      # IP_BLOCK_ENABLED: "true"
 
     volumes:
       - /var/lib/marzban-node:/var/lib/marzban-node

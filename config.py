@@ -21,19 +21,22 @@ SERVICE_PROTOCOL = config('SERVICE_PROTOCOL', cast=str, default='rest')
 
 INBOUNDS = config("INBOUNDS", cast=lambda v: [x.strip() for x in v.split(',')] if v else [], default="")
 
-# Remote Xray binary updates replace the running proxy engine's executable —
-# opt-in only, since a bad version/network blip during the swap is the
-# highest-impact failure mode of anything this node exposes.
-XRAY_REMOTE_UPDATE_ENABLED = config("XRAY_REMOTE_UPDATE_ENABLED", cast=bool, default=False)
+# Remote Xray binary updates replace the running proxy engine's executable.
+# On by default in this fork; set to false to opt out. A bad version/network
+# blip during the swap is the highest-impact failure mode of anything this
+# node exposes, and xray_updater.py backs up + verifies + rolls back around
+# it, but the safety net only matters if you're aware this can happen.
+XRAY_REMOTE_UPDATE_ENABLED = config("XRAY_REMOTE_UPDATE_ENABLED", cast=bool, default=True)
 
 # ipset/iptables IP blocking manipulates the *host's* firewall state and (per
-# docker-compose.yml) requires NET_ADMIN/NET_RAW. Opt-in for the same reason
-# as XRAY_REMOTE_UPDATE_ENABLED: this service can be run without
+# docker-compose.yml) requires NET_ADMIN/NET_RAW — without those capabilities
+# granted to the container, calls to it simply fail cleanly. On by default in
+# this fork; set to false to opt out. This service can be run without
 # SSL_CLIENT_CERT_FILE (explicitly supported, though discouraged — see
-# main.py), in which case any peer that can reach it can call any exposed
-# method. Without this gate, that peer could add arbitrary source addresses
+# main.py, which now warns loudly if that's the case while this is on), in
+# which case any peer that can reach it could add arbitrary source addresses
 # — including the panel's own — to the host's blocklist.
-IP_BLOCK_ENABLED = config("IP_BLOCK_ENABLED", cast=bool, default=False)
+IP_BLOCK_ENABLED = config("IP_BLOCK_ENABLED", cast=bool, default=True)
 
 # Repo whose GitHub Releases are checked for a newer marzban-node version.
 # Only used to answer "is an update available" — this process never

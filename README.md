@@ -17,14 +17,31 @@ sudo bash -c "$(curl -sL https://github.com/vovausername/Marzban-node/raw/master
 ```
 
 During install, you'll be asked (in addition to the usual protocol/cert/port
-prompts) whether to enable this fork's two opt-in remote-control triggers:
-remote Xray updates and temporary IP blocking. Both default to **no** — see
+prompts) whether to enable this fork's two remote-control triggers: remote
+Xray updates and temporary IP blocking. Both default to **yes** — see
 `.env.example` for the underlying `XRAY_REMOTE_UPDATE_ENABLED` /
-`IP_BLOCK_ENABLED` variables if you want to turn them on later by hand.
+`IP_BLOCK_ENABLED` variables if you want to turn either off later by hand.
+Both require the node to actually be running with a client certificate
+(`SSL_CLIENT_CERT_FILE`) to be safe — the node logs a loud warning on
+startup if either is enabled without one.
 
 Use `help` to view all commands:
 ```marzban-node help```
 
+## Migrating an existing node from upstream
+
+If you already have a node installed from the original
+`Gozargah/Marzban-scripts` installer (pointing at `gozargah/marzban-node`),
+switch it to this fork in place with:
+```bash
+sudo bash -c "$(curl -sL https://github.com/vovausername/Marzban-node/raw/master/marzban-node.sh)" @ migrate
+```
+This rewrites the node's existing `docker-compose.yml` to use this fork's
+image, asks whether to turn on the two remote-control triggers (adding
+`NET_ADMIN`/`NET_RAW` if you say yes), pulls the new image, and restarts —
+without touching your existing certificate, ports, or protocol choice.
+Re-running `migrate` at any time is safe (it detects it's already on this
+fork's image and just leaves it alone).
 
 ## Manual install
 Read the setup guide here: https://gozargah.github.io/marzban/docs/marzban-node
