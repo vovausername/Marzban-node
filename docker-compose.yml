@@ -1,7 +1,7 @@
 services:
   marzban-node:
-    build: .
-    # image: gozargah/marzban-node:latest
+    image: ghcr.io/vovausername/marzban-node:latest
+    # build: .  # use this instead to build from source (e.g. testing an unreleased change)
     restart: always
     network_mode: host
 
