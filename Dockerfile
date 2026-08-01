@@ -17,8 +17,21 @@ RUN python3 -m pip install --upgrade pip setuptools \
 
 FROM python:$PYTHON_VERSION-slim
 
+# Baked into the VERSION file below so version_check.py's self-update
+# check reports the actual released version, not whatever was committed
+# in the repo at build time. Passed by CI as VERSION=<tag without the
+# leading "v">; defaults to "dev" for local/manual builds.
+ARG VERSION=dev
+
 ENV PYTHON_LIB_PATH=/usr/local/lib/python${PYTHON_VERSION%.*}/site-packages
 WORKDIR /code
+
+# ipset + iptables/ip6tables are required by ip_block.py's temporary IP
+# blocking (see docker-compose.yml for the NET_ADMIN/NET_RAW capabilities
+# that let this container actually use them).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ipset iptables \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN rm -rf $PYTHON_LIB_PATH/*
 
@@ -27,5 +40,6 @@ COPY --from=build /usr/local/bin /usr/local/bin
 COPY --from=build /usr/local/share/xray /usr/local/share/xray
 
 COPY . /code
+RUN echo "${VERSION#v}" > /code/VERSION
 
 CMD ["bash", "-c", "python main.py"]

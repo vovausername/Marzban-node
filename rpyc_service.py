@@ -4,7 +4,10 @@ from threading import Thread
 
 import rpyc
 
-from config import XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH
+import ip_block
+import version_check
+import xray_updater
+from config import IP_BLOCK_ENABLED, XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH, XRAY_REMOTE_UPDATE_ENABLED
 from logger import logger
 from xray import XRayConfig, XRayCore
 
@@ -109,6 +112,7 @@ class XrayService(rpyc.Service):
                     "Peer doesn't have on_stop function on it's service, skipped")
 
             self.core.start(config)
+            self.core.config = config
         except Exception as exc:
             logger.error(exc)
             raise exc
@@ -126,6 +130,7 @@ class XrayService(rpyc.Service):
     def restart(self, config: str):
         config = XRayConfig(config, self.connection.peer)
         self.core.restart(config)
+        self.core.config = config
 
     @rpyc.exposed
     def fetch_xray_version(self):
@@ -133,6 +138,34 @@ class XrayService(rpyc.Service):
             raise ProcessLookupError("Xray has not been started")
 
         return self.core.version
+
+    @rpyc.exposed
+    def block_ip(self, ip: str, minutes: int) -> dict:
+        if not IP_BLOCK_ENABLED:
+            raise PermissionError(
+                "IP blocking is disabled. Set IP_BLOCK_ENABLED=true to allow it."
+            )
+        try:
+            return ip_block.block_ip(ip, minutes)
+        except ip_block.IpBlockError as exc:
+            raise ValueError(str(exc))
+
+    @rpyc.exposed
+    def update_xray(self, version: str) -> dict:
+        if not XRAY_REMOTE_UPDATE_ENABLED:
+            raise PermissionError(
+                "Remote Xray updates are disabled. Set XRAY_REMOTE_UPDATE_ENABLED=true to allow them."
+            )
+        if self.core is None:
+            raise ProcessLookupError("Xray has not been started")
+        try:
+            return xray_updater.update(version, self.core)
+        except xray_updater.XrayUpdateError as exc:
+            raise ValueError(str(exc))
+
+    @rpyc.exposed
+    def check_for_update(self) -> dict:
+        return version_check.check_for_update()
 
     @rpyc.exposed
     def fetch_logs(self, callback: callable) -> XrayCoreLogsHandler:

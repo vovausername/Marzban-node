@@ -10,7 +10,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketDisconnect
 
-from config import XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH
+import ip_block
+import version_check
+import xray_updater
+from config import IP_BLOCK_ENABLED, XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH, XRAY_REMOTE_UPDATE_ENABLED
 from logger import logger
 from xray import XRayConfig, XRayCore
 
@@ -49,6 +52,9 @@ class Service(object):
         self.router.add_api_route("/start", self.start, methods=["POST"])
         self.router.add_api_route("/stop", self.stop, methods=["POST"])
         self.router.add_api_route("/restart", self.restart, methods=["POST"])
+        self.router.add_api_route("/block-ip", self.block_ip, methods=["POST"])
+        self.router.add_api_route("/update-xray", self.update_xray, methods=["POST"])
+        self.router.add_api_route("/check-for-update", self.check_for_update, methods=["POST"])
 
         self.router.add_websocket_route("/logs", self.logs)
 
@@ -153,6 +159,7 @@ class Service(object):
                 detail=last_log
             )
 
+        self.core.config = config
         return self.response()
 
     def stop(self, session_id: UUID = Body(embed=True)):
@@ -208,7 +215,43 @@ class Service(object):
                 detail=last_log
             )
 
+        self.core.config = config
         return self.response()
+
+    def block_ip(
+        self,
+        session_id: UUID = Body(embed=True),
+        ip: str = Body(embed=True),
+        minutes: int = Body(embed=True),
+    ):
+        self.match_session_id(session_id)
+        if not IP_BLOCK_ENABLED:
+            raise HTTPException(
+                status_code=403,
+                detail="IP blocking is disabled. Set IP_BLOCK_ENABLED=true to allow it.",
+            )
+        try:
+            return ip_block.block_ip(ip, minutes)
+        except ip_block.IpBlockError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    def update_xray(self, session_id: UUID = Body(embed=True), version: str = Body(embed=True)):
+        self.match_session_id(session_id)
+        if not XRAY_REMOTE_UPDATE_ENABLED:
+            raise HTTPException(
+                status_code=403,
+                detail="Remote Xray updates are disabled. Set XRAY_REMOTE_UPDATE_ENABLED=true to allow them.",
+            )
+        try:
+            result = xray_updater.update(version, self.core)
+        except xray_updater.XrayUpdateError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        self.core_version = self.core.version
+        return result
+
+    def check_for_update(self, session_id: UUID = Body(embed=True)):
+        self.match_session_id(session_id)
+        return version_check.check_for_update()
 
     async def logs(self, websocket: WebSocket):
         session_id = websocket.query_params.get('session_id')

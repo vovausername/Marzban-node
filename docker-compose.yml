@@ -1,9 +1,16 @@
 services:
   marzban-node:
-    # build: .
-    image: gozargah/marzban-node:latest
+    image: ghcr.io/vovausername/marzban-node:latest
+    # build: .  # use this instead to build from source (e.g. testing an unreleased change)
     restart: always
     network_mode: host
+
+    # NET_ADMIN + NET_RAW let this container manage the ipset/iptables rules
+    # ip_block.py uses for temporary IP blocking. Remove both if you never
+    # intend to use that feature — everything else works without them.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
 
     # env_file: .env
     environment:
@@ -11,6 +18,10 @@ services:
       SSL_KEY_FILE: "/var/lib/marzban-node/ssl_key.pem"
       # SSL_CLIENT_CERT_FILE: "/var/lib/marzban-node/ssl_client_cert.pem"
       # SERVICE_PROTOCOL: "rest"
+      # Both remote-control triggers below default to enabled in this fork.
+      # Uncomment and set to "false" to opt out of either one.
+      # XRAY_REMOTE_UPDATE_ENABLED: "true"
+      # IP_BLOCK_ENABLED: "true"
 
     volumes:
       - /var/lib/marzban-node:/var/lib/marzban-node
