@@ -3,7 +3,8 @@
 This module never updates anything — Docker deployments update by pulling
 a new image (`docker compose pull && up -d`), which a container cannot
 safely trigger for itself from the inside. It only answers "is there
-something newer", so the controlling panel can surface that to an admin.
+something newer"; actually applying an update is node_updater.py's job,
+which hands the pull-and-recreate off to a host-side watcher.
 """
 import json
 import os

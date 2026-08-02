@@ -7,9 +7,10 @@ from rpyc.utils.server import ThreadedServer
 import rest_service
 import rpyc_service
 from certificate import generate_certificate
-from config import (IP_BLOCK_ENABLED, SERVICE_HOST, SERVICE_PORT,
-                    SERVICE_PROTOCOL, SSL_CERT_FILE, SSL_KEY_FILE,
-                    SSL_CLIENT_CERT_FILE, XRAY_REMOTE_UPDATE_ENABLED)
+from config import (IP_BLOCK_ENABLED, NODE_REMOTE_UPDATE_ENABLED,
+                    SERVICE_HOST, SERVICE_PORT, SERVICE_PROTOCOL,
+                    SSL_CERT_FILE, SSL_KEY_FILE, SSL_CLIENT_CERT_FILE,
+                    XRAY_REMOTE_UPDATE_ENABLED)
 from logger import logger
 
 
@@ -31,12 +32,13 @@ if __name__ == "__main__":
     if not SSL_CLIENT_CERT_FILE:
         logger.warning(
             "You are running node without SSL_CLIENT_CERT_FILE, be aware that everyone can connect to this node and this isn't secure!")
-        if IP_BLOCK_ENABLED or XRAY_REMOTE_UPDATE_ENABLED:
+        if IP_BLOCK_ENABLED or XRAY_REMOTE_UPDATE_ENABLED or NODE_REMOTE_UPDATE_ENABLED:
             logger.warning(
-                "IP_BLOCK_ENABLED and/or XRAY_REMOTE_UPDATE_ENABLED are on (this fork's "
-                "default) with no client-cert authentication — any peer that can reach "
-                "this node can trigger them. Set SSL_CLIENT_CERT_FILE, or set these to "
-                "false, before relying on this in production.")
+                "IP_BLOCK_ENABLED, XRAY_REMOTE_UPDATE_ENABLED and/or "
+                "NODE_REMOTE_UPDATE_ENABLED are on (this fork's default) with no "
+                "client-cert authentication — any peer that can reach this node can "
+                "trigger them. Set SSL_CLIENT_CERT_FILE, or set these to false, "
+                "before relying on this in production.")
 
     if SSL_CLIENT_CERT_FILE and not os.path.isfile(SSL_CLIENT_CERT_FILE):
         logger.error("Client's certificate file specified on SSL_CLIENT_CERT_FILE is missing")

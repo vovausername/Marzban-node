@@ -11,11 +11,14 @@ from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketDisconnect
 
 import ip_block
+import node_updater
 import system_stats
 import version_check
 import xray_hot_reload
 import xray_updater
-from config import IP_BLOCK_ENABLED, XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH, XRAY_REMOTE_UPDATE_ENABLED
+from config import (IP_BLOCK_ENABLED, NODE_REMOTE_UPDATE_ENABLED,
+                    XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH,
+                    XRAY_REMOTE_UPDATE_ENABLED)
 from logger import logger
 from xray import XRayConfig, XRayCore
 
@@ -57,6 +60,8 @@ class Service(object):
         self.router.add_api_route("/block-ip", self.block_ip, methods=["POST"])
         self.router.add_api_route("/update-xray", self.update_xray, methods=["POST"])
         self.router.add_api_route("/check-for-update", self.check_for_update, methods=["POST"])
+        self.router.add_api_route("/update-node", self.update_node, methods=["POST"])
+        self.router.add_api_route("/update-node-status", self.update_node_status, methods=["POST"])
         self.router.add_api_route("/healthcheck", self.healthcheck, methods=["GET"])
         self.router.add_api_route("/system-stats", self.system_stats, methods=["POST"])
 
@@ -269,6 +274,22 @@ class Service(object):
     def check_for_update(self, session_id: UUID = Body(embed=True)):
         self.match_session_id(session_id)
         return version_check.check_for_update()
+
+    def update_node(self, session_id: UUID = Body(embed=True), force: bool = Body(False, embed=True)):
+        self.match_session_id(session_id)
+        if not NODE_REMOTE_UPDATE_ENABLED:
+            raise HTTPException(
+                status_code=403,
+                detail="Remote node updates are disabled. Set NODE_REMOTE_UPDATE_ENABLED=true to allow them.",
+            )
+        try:
+            return node_updater.request_update(force=force)
+        except node_updater.NodeUpdateError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    def update_node_status(self, session_id: UUID = Body(embed=True)):
+        self.match_session_id(session_id)
+        return node_updater.get_status()
 
     def healthcheck(self):
         # No session_id on purpose: this is for monitoring, and mTLS alone

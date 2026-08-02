@@ -59,6 +59,23 @@ XRAY_HOT_RELOAD_ENABLED = config("XRAY_HOT_RELOAD_ENABLED", cast=bool, default=T
 XRAY_LOCAL_API_PORT = config("XRAY_LOCAL_API_PORT", cast=int, default=62052)
 
 # Repo whose GitHub Releases are checked for a newer marzban-node version.
-# Only used to answer "is an update available" — this process never
-# updates itself, since Docker deployments update by pulling a new image.
+# Used both to answer "is an update available" and as the guard for
+# panel-triggered node updates (node_updater.py refuses to schedule one,
+# unless forced, when this repo shows nothing newer).
 UPDATE_CHECK_REPO = config("UPDATE_CHECK_REPO", default="vovausername/Marzban-node")
+
+# Let the panel trigger an update of marzban-node itself. The container
+# can't recreate itself, so this only writes a request file into
+# NODE_UPDATE_SHARED_DIR; the actual `docker compose pull && up` is done by
+# a host-side systemd watcher installed with `marzban-node.sh
+# install-updater` — without that watcher the request is refused with a
+# clear error, so this flag is inert on hosts that never opted in. On by
+# default in this fork; set to false to opt out.
+NODE_REMOTE_UPDATE_ENABLED = config("NODE_REMOTE_UPDATE_ENABLED", cast=bool, default=True)
+
+# Directory shared between this container and the host (the bind mount in
+# docker-compose.yml) through which node update requests/results are
+# exchanged with the host watcher. Must match the directory the watcher
+# monitors — for script-managed installs that's /var/lib/<app name> on the
+# host, mounted here as /var/lib/marzban-node.
+NODE_UPDATE_SHARED_DIR = config("NODE_UPDATE_SHARED_DIR", default="/var/lib/marzban-node")

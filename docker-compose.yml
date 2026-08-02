@@ -23,6 +23,11 @@ services:
       # XRAY_REMOTE_UPDATE_ENABLED: "true"
       # IP_BLOCK_ENABLED: "true"
       # XRAY_HOT_RELOAD_ENABLED: "true"
+      # NODE_REMOTE_UPDATE_ENABLED only makes the node accept the panel's
+      # update-node request; the update itself is done by a host-side
+      # watcher — run `marzban-node.sh install-updater` on the host to
+      # install it (requests are refused until then).
+      # NODE_REMOTE_UPDATE_ENABLED: "true"
 
     volumes:
       - /var/lib/marzban-node:/var/lib/marzban-node
