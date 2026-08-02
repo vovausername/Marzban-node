@@ -18,10 +18,16 @@ services:
       SSL_KEY_FILE: "/var/lib/marzban-node/ssl_key.pem"
       # SSL_CLIENT_CERT_FILE: "/var/lib/marzban-node/ssl_client_cert.pem"
       # SERVICE_PROTOCOL: "rest"
-      # Both remote-control triggers below default to enabled in this fork.
-      # Uncomment and set to "false" to opt out of either one.
+      # The fork's extra features below default to enabled. Uncomment and
+      # set to "false" to opt out of any of them.
       # XRAY_REMOTE_UPDATE_ENABLED: "true"
       # IP_BLOCK_ENABLED: "true"
+      # XRAY_HOT_RELOAD_ENABLED: "true"
 
     volumes:
       - /var/lib/marzban-node:/var/lib/marzban-node
+
+    # No healthcheck on purpose: the REST service requires the panel's
+    # client certificate at the TLS layer (ssl_cert_reqs=2), so an
+    # in-container curl of GET /healthcheck can't connect. That endpoint is
+    # meant for the panel / monitoring systems holding the client cert.

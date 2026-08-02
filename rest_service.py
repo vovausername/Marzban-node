@@ -11,7 +11,9 @@ from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketDisconnect
 
 import ip_block
+import system_stats
 import version_check
+import xray_hot_reload
 import xray_updater
 from config import IP_BLOCK_ENABLED, XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH, XRAY_REMOTE_UPDATE_ENABLED
 from logger import logger
@@ -55,6 +57,8 @@ class Service(object):
         self.router.add_api_route("/block-ip", self.block_ip, methods=["POST"])
         self.router.add_api_route("/update-xray", self.update_xray, methods=["POST"])
         self.router.add_api_route("/check-for-update", self.check_for_update, methods=["POST"])
+        self.router.add_api_route("/healthcheck", self.healthcheck, methods=["GET"])
+        self.router.add_api_route("/system-stats", self.system_stats, methods=["POST"])
 
         self.router.add_websocket_route("/logs", self.logs)
 
@@ -186,6 +190,14 @@ class Service(object):
                 }
             )
 
+        # Hot path: identical config -> no-op; only client lists changed ->
+        # applied to the live core without dropping user connections. Any
+        # other difference (or hot-path error) falls through to the full
+        # restart below.
+        if xray_hot_reload.try_hot_reload(self.core, config):
+            self.core.config = config
+            return self.response()
+
         try:
             with self.core.get_logs() as logs:
                 self.core.restart(config)
@@ -252,6 +264,20 @@ class Service(object):
     def check_for_update(self, session_id: UUID = Body(embed=True)):
         self.match_session_id(session_id)
         return version_check.check_for_update()
+
+    def healthcheck(self):
+        # No session_id on purpose: this is for monitoring, and mTLS alone
+        # already gates it (uvicorn runs with ssl_cert_reqs=2).
+        return {
+            "isAlive": True,
+            "isXrayOnline": self.core.started,
+            "xrayVersion": self.core_version,
+            "nodeVersion": version_check.CURRENT_VERSION,
+        }
+
+    def system_stats(self, session_id: UUID = Body(embed=True)):
+        self.match_session_id(session_id)
+        return system_stats.get_system_stats()
 
     async def logs(self, websocket: WebSocket):
         session_id = websocket.query_params.get('session_id')
