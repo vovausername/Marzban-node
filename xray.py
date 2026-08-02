@@ -6,8 +6,19 @@ import threading
 from collections import deque
 from contextlib import contextmanager
 
-from config import DEBUG, SSL_CERT_FILE, SSL_KEY_FILE, XRAY_API_HOST, XRAY_API_PORT, INBOUNDS
+from config import (DEBUG, SSL_CERT_FILE, SSL_KEY_FILE, XRAY_API_HOST,
+                    XRAY_API_PORT, XRAY_HOT_RELOAD_ENABLED,
+                    XRAY_LOCAL_API_PORT, INBOUNDS)
 from logger import logger
+
+
+def get_xray_version(executable_path: str):
+    cmd = [executable_path, "version"]
+    output = subprocess.check_output(
+        cmd, stderr=subprocess.STDOUT).decode('utf-8')
+    m = re.match(r'^Xray (\d+\.\d+\.\d+)', output)
+    if m:
+        return m.groups()[0]
 
 
 class XRayConfig(dict):
@@ -33,9 +44,10 @@ class XRayConfig(dict):
 
     def _apply_api(self):
         for inbound in self.get('inbounds', []).copy():
-            if inbound.get('protocol') == 'dokodemo-door' and inbound.get('tag') == 'API_INBOUND':
+            if inbound.get('protocol') == 'dokodemo-door' and inbound.get('tag') in ('API_INBOUND',
+                                                                                     'API_INBOUND_LOCAL'):
                 self['inbounds'].remove(inbound)
-                
+
             elif INBOUNDS and inbound.get('tag') not in INBOUNDS:
                 self['inbounds'].remove(inbound)
 
@@ -79,10 +91,23 @@ class XRayConfig(dict):
             self["inbounds"] = []
             self["inbounds"].insert(0, inbound)
 
+        api_inbound_tags = ["API_INBOUND"]
+        if XRAY_HOT_RELOAD_ENABLED:
+            # Loopback-only plaintext twin of the API inbound above: the
+            # `xray api` CLI used by xray_hot_reload.py can't speak TLS.
+            self["inbounds"].insert(1, {
+                "listen": "127.0.0.1",
+                "port": XRAY_LOCAL_API_PORT,
+                "protocol": "dokodemo-door",
+                "settings": {
+                    "address": "127.0.0.1"
+                },
+                "tag": "API_INBOUND_LOCAL"
+            })
+            api_inbound_tags.append("API_INBOUND_LOCAL")
+
         rule = {
-            "inboundTag": [
-                "API_INBOUND"
-            ],
+            "inboundTag": api_inbound_tags,
             "source": [
                 "127.0.0.1",
                 self.peer_ip
@@ -119,12 +144,7 @@ class XRayCore:
         atexit.register(lambda: self.stop() if self.started else None)
 
     def get_version(self):
-        cmd = [self.executable_path, "version"]
-        output = subprocess.check_output(
-            cmd, stderr=subprocess.STDOUT).decode('utf-8')
-        m = re.match(r'^Xray (\d+\.\d+\.\d+)', output)
-        if m:
-            return m.groups()[0]
+        return get_xray_version(self.executable_path)
 
     def __capture_process_logs(self):
         def capture_and_debug_log():

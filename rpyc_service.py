@@ -5,11 +5,13 @@ from threading import Thread
 import rpyc
 
 import ip_block
+import system_stats
 import version_check
+import xray_hot_reload
 import xray_updater
 from config import IP_BLOCK_ENABLED, XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH, XRAY_REMOTE_UPDATE_ENABLED
 from logger import logger
-from xray import XRayConfig, XRayCore
+from xray import XRayConfig, XRayCore, get_xray_version
 
 
 class XrayCoreLogsHandler(object):
@@ -129,8 +131,22 @@ class XrayService(rpyc.Service):
     @rpyc.exposed
     def restart(self, config: str):
         config = XRayConfig(config, self.connection.peer)
-        self.core.restart(config)
-        self.core.config = config
+
+        # restart_lock spans the hot-reload attempt, the fallback full
+        # restart and the core.config update: overlapping restart requests
+        # must not diff against a core.config another thread is still
+        # bringing in sync with the live process.
+        with xray_hot_reload.restart_lock:
+            # Hot path: identical config -> no-op; only client lists
+            # changed -> applied to the live core without dropping user
+            # connections (core.config updated inside). Any other
+            # difference (or hot-path error) falls through to the full
+            # restart below.
+            if self.core is not None and xray_hot_reload.try_hot_reload(self.core, config):
+                return
+
+            self.core.restart(config)
+            self.core.config = config
 
     @rpyc.exposed
     def fetch_xray_version(self):
@@ -166,6 +182,26 @@ class XrayService(rpyc.Service):
     @rpyc.exposed
     def check_for_update(self) -> dict:
         return version_check.check_for_update()
+
+    @rpyc.exposed
+    def healthcheck(self) -> dict:
+        if self.core is not None:
+            xray_version = self.core.version
+        else:
+            try:
+                xray_version = get_xray_version(XRAY_EXECUTABLE_PATH)
+            except Exception:
+                xray_version = None
+        return {
+            "isAlive": True,
+            "isXrayOnline": self.core is not None and self.core.started,
+            "xrayVersion": xray_version,
+            "nodeVersion": version_check.CURRENT_VERSION,
+        }
+
+    @rpyc.exposed
+    def get_system_stats(self) -> dict:
+        return system_stats.get_system_stats()
 
     @rpyc.exposed
     def fetch_logs(self, callback: callable) -> XrayCoreLogsHandler:

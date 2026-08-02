@@ -38,6 +38,26 @@ XRAY_REMOTE_UPDATE_ENABLED = config("XRAY_REMOTE_UPDATE_ENABLED", cast=bool, def
 # — including the panel's own — to the host's blocklist.
 IP_BLOCK_ENABLED = config("IP_BLOCK_ENABLED", cast=bool, default=True)
 
+# Apply user (client) additions/removals from the panel's restart calls to
+# the live Xray process via its HandlerService API instead of restarting the
+# whole core — a full restart drops every active user connection. Only a
+# config whose SOLE difference from the running one is the inbound client
+# lists is applied hot; an identical config becomes a no-op, and anything
+# else (ports, stream settings, routing, ...) or any error in the hot path
+# falls back to the plain full restart, so the node can never keep running
+# a config the panel didn't send. Hot-applying needs an Xray binary >=
+# v25.7.26 (first release shipping `xray api adu`/`rmu`); older binaries
+# are detected and silently keep the full-restart behavior. On by default
+# in this fork; set to false to opt out.
+XRAY_HOT_RELOAD_ENABLED = config("XRAY_HOT_RELOAD_ENABLED", cast=bool, default=True)
+
+# Port of the loopback-only plaintext Xray API inbound injected alongside
+# the panel's TLS one when hot reload is enabled — the `xray api` CLI only
+# speaks plaintext gRPC, so it can't use the panel's inbound. Always bound
+# to 127.0.0.1, but since the container runs with network_mode: host that
+# is the host's loopback: change this if 62052 collides with something.
+XRAY_LOCAL_API_PORT = config("XRAY_LOCAL_API_PORT", cast=int, default=62052)
+
 # Repo whose GitHub Releases are checked for a newer marzban-node version.
 # Only used to answer "is an update available" — this process never
 # updates itself, since Docker deployments update by pulling a new image.
