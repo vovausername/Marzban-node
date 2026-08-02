@@ -67,9 +67,14 @@ def _ensure_ready(is_v6: bool) -> None:
     _initialized[key] = True
 
 
-def block_ip(ip: str, minutes: int) -> dict:
-    if minutes <= 0:
-        raise IpBlockError("minutes must be positive")
+def block_ip(ip: str, minutes: float) -> dict:
+    # Fractional minutes are allowed (e.g. 0.1 = 6s) for callers that want a
+    # near-instant block; ipset's --timeout only accepts whole seconds, so
+    # round rather than truncate (0.1 * 60 can land on 5.999999999999999
+    # due to float representation).
+    seconds = round(minutes * 60)
+    if seconds <= 0:
+        raise IpBlockError("minutes must resolve to a positive number of seconds")
 
     try:
         parsed = ipaddress.ip_address(ip)
@@ -80,11 +85,10 @@ def block_ip(ip: str, minutes: int) -> dict:
     _ensure_ready(is_v6)
 
     set_name = _IPSET_V6 if is_v6 else _IPSET_V4
-    seconds = minutes * 60
     # -exist: refresh the timeout instead of erroring if already blocked.
     _run_checked(["ipset", "add", set_name, str(parsed), "timeout", str(seconds), "-exist"])
 
-    logger.warning(f"Blocked {parsed} for {minutes} minute(s)")
+    logger.warning(f"Blocked {parsed} for {seconds}s")
     return {"ip": str(parsed), "minutes": minutes}
 
 
