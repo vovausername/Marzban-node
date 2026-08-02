@@ -11,6 +11,7 @@ iptables rule) and have ipset + iptables installed; see Dockerfile /
 docker-compose.yml.
 """
 import ipaddress
+import math
 import shutil
 import subprocess
 
@@ -68,6 +69,14 @@ def _ensure_ready(is_v6: bool) -> None:
 
 
 def block_ip(ip: str, minutes: float) -> dict:
+    # The REST/RPyC layers accept an unconstrained float, and Python's float()
+    # happily parses "NaN"/"Infinity" strings, so a caller can hand us a
+    # non-finite value here. round() raises ValueError on NaN and
+    # OverflowError on +/-inf instead of returning something block_ip could
+    # reject cleanly, so both must be ruled out before doing that arithmetic.
+    if not math.isfinite(minutes):
+        raise IpBlockError("minutes must be a finite number")
+
     # Fractional minutes are allowed (e.g. 0.1 = 6s) for callers that want a
     # near-instant block; ipset's --timeout only accepts whole seconds, so
     # round rather than truncate (0.1 * 60 can land on 5.999999999999999
