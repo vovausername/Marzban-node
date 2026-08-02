@@ -57,11 +57,28 @@ split in two:
    release actually exists (pass `force: true` to skip that and re-pull
    anyway) and drops a request file into `/var/lib/marzban-node`, which is
    bind-mounted from the host.
-2. **On the host**: a small systemd path unit — installed with
-   `sudo marzban-node install-updater` (offered automatically during
-   `install` and `migrate`) — notices the request, runs
+2. **On the host**: a small systemd path unit notices the request, runs
    `docker compose pull` + `up -d --force-recreate`, and writes the outcome
-   to a result file.
+   to a result file. You almost never install it by hand: `install` and
+   `migrate` offer it, and every `marzban-node update` installs/refreshes
+   it automatically (unless the compose file says
+   `NODE_REMOTE_UPDATE_ENABLED: "false"`). After each successful
+   panel-triggered update the watcher also regenerates itself from the
+   freshly updated CLI, so watcher improvements roll out with normal node
+   updates — no per-node commands ever again. `sudo marzban-node
+   install-updater` / `uninstall-updater` exist for doing it explicitly.
+
+### Rolling this out to nodes you already have
+
+Existing nodes need one last manual update to pick this feature up (their
+installed CLI predates it, so run the one-liner, which always executes the
+latest script):
+```bash
+sudo bash -c "$(curl -sL https://github.com/vovausername/Marzban-node/raw/master/marzban-node.sh)" @ update
+```
+That single command updates the node **and** installs the watcher. From
+then on, every update — of the node and of the watcher itself — can be
+triggered from the panel.
 
 The panel can poll `POST /update-node-status` (RPyC:
 `update_node_status()`) to see whether a request is pending and how the
