@@ -540,12 +540,22 @@ EOF
 set -u
 WORKING_FILE="$REQUEST_FILE.working"
 
-[ -f "$REQUEST_FILE" ] || exit 0
-
-# Claim the request atomically before doing anything: if this script dies
-# mid-update, no request file is left behind to re-trigger the systemd
-# path unit forever.
-mv -f "$REQUEST_FILE" "$WORKING_FILE" || exit 0
+stale=""
+if [ -e "$REQUEST_FILE" ]; then
+    # Claim the request atomically before doing anything: if this script
+    # dies mid-update, no request file is left behind to re-trigger the
+    # systemd path unit forever.
+    mv -f "$REQUEST_FILE" "$WORKING_FILE" || exit 0
+elif [ -e "$WORKING_FILE" ]; then
+    # A previous run was cut short (host reboot, killed service) after
+    # claiming the request but before cleaning up. The path unit also
+    # watches this file, so we get here on the next boot/trigger: fail the
+    # request deterministically instead of leaving the node reporting a
+    # pending update forever with nothing ever resuming it.
+    stale=1
+else
+    exit 0
+fi
 
 if docker compose >/dev/null 2>&1; then
     COMPOSE="docker compose"
@@ -555,12 +565,21 @@ else
     COMPOSE=""
 fi
 
-request_id=$(jq -r '.request_id // ""' "$WORKING_FILE" 2>/dev/null)
+# Only parse the claimed request if it's a real file: the shared
+# directory is container-writable, so never let this root process read
+# through a planted symlink.
+request_id=""
+if [ -f "$WORKING_FILE" ] && ! [ -L "$WORKING_FILE" ]; then
+    request_id=$(jq -r '.request_id // ""' "$WORKING_FILE" 2>/dev/null)
+fi
 started_at=$(date -u +%FT%TZ)
 status="success"
 detail="Pulled the latest image and recreated the container"
 
-if [ -z "$COMPOSE" ]; then
+if [ -n "$stale" ]; then
+    status="failed"
+    detail="Previous update attempt was interrupted (host reboot or watcher restart) and has been abandoned; trigger the update again from the panel"
+elif [ -z "$COMPOSE" ]; then
     status="failed"
     detail="docker compose not found on the host"
 elif [ ! -f "$COMPOSE_FILE" ]; then
@@ -587,10 +606,19 @@ if [ "$status" = "success" ]; then
 fi
 
 finished_at=$(date -u +%FT%TZ)
-jq -n --arg status "$status" --arg detail "$detail" --arg request_id "$request_id" \
+# The shared directory is container-writable, so a compromised container
+# could plant the .tmp path as a symlink to a host file and have this
+# root process write through it. rm first (rm doesn't follow symlinks),
+# then open with noclobber — O_CREAT|O_EXCL refuses to follow a symlink
+# recreated in the gap — and rename into place (rename replaces, never
+# follows, a symlinked destination).
+rm -f "$RESULT_FILE.tmp"
+if (set -o noclobber; jq -n --arg status "$status" --arg detail "$detail" --arg request_id "$request_id" \
       --arg started_at "$started_at" --arg finished_at "$finished_at" \
       '{status: $status, detail: $detail, request_id: $request_id, started_at: $started_at, finished_at: $finished_at}' \
-      > "$RESULT_FILE.tmp" 2>/dev/null && mv -f "$RESULT_FILE.tmp" "$RESULT_FILE"
+      > "$RESULT_FILE.tmp") 2>/dev/null; then
+    mv -f "$RESULT_FILE.tmp" "$RESULT_FILE"
+fi
 rm -f "$WORKING_FILE"
 
 # Regenerate this watcher from the (possibly just-refreshed) CLI so
@@ -619,6 +647,10 @@ Description=Watch for $APP_NAME node update requests from the panel
 
 [Path]
 PathExists=$UPDATE_REQUEST_FILE
+# Also watch the claimed-but-unfinished marker, so a request stranded by
+# a reboot or killed run gets failed out on the next trigger instead of
+# blocking every future update (the script removes it in all paths).
+PathExists=$UPDATE_REQUEST_FILE.working
 
 [Install]
 WantedBy=multi-user.target
