@@ -190,45 +190,50 @@ class Service(object):
                 }
             )
 
-        # Hot path: identical config -> no-op; only client lists changed ->
-        # applied to the live core without dropping user connections. Any
-        # other difference (or hot-path error) falls through to the full
-        # restart below.
-        if xray_hot_reload.try_hot_reload(self.core, config):
+        # restart_lock spans the hot-reload attempt, the fallback full
+        # restart and the core.config update: overlapping restart requests
+        # must not diff against a core.config another thread is still
+        # bringing in sync with the live process.
+        with xray_hot_reload.restart_lock:
+            # Hot path: identical config -> no-op; only client lists
+            # changed -> applied to the live core without dropping user
+            # connections (core.config updated inside). Any other
+            # difference (or hot-path error) falls through to the full
+            # restart below.
+            if xray_hot_reload.try_hot_reload(self.core, config):
+                return self.response()
+
+            try:
+                with self.core.get_logs() as logs:
+                    self.core.restart(config)
+
+                    start_time = time.time()
+                    end_time = start_time + 3
+                    last_log = ''
+                    while time.time() < end_time:
+                        while logs:
+                            log = logs.popleft()
+                            if log:
+                                last_log = log
+                            if f'Xray {self.core_version} started' in log:
+                                break
+                        time.sleep(0.1)
+
+            except Exception as exc:
+                logger.error(f"Failed to restart core: {exc}")
+                raise HTTPException(
+                    status_code=503,
+                    detail=str(exc)
+                )
+
+            if not self.core.started:
+                raise HTTPException(
+                    status_code=503,
+                    detail=last_log
+                )
+
             self.core.config = config
             return self.response()
-
-        try:
-            with self.core.get_logs() as logs:
-                self.core.restart(config)
-
-                start_time = time.time()
-                end_time = start_time + 3
-                last_log = ''
-                while time.time() < end_time:
-                    while logs:
-                        log = logs.popleft()
-                        if log:
-                            last_log = log
-                        if f'Xray {self.core_version} started' in log:
-                            break
-                    time.sleep(0.1)
-
-        except Exception as exc:
-            logger.error(f"Failed to restart core: {exc}")
-            raise HTTPException(
-                status_code=503,
-                detail=str(exc)
-            )
-
-        if not self.core.started:
-            raise HTTPException(
-                status_code=503,
-                detail=last_log
-            )
-
-        self.core.config = config
-        return self.response()
 
     def block_ip(
         self,

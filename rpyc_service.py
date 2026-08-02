@@ -132,16 +132,21 @@ class XrayService(rpyc.Service):
     def restart(self, config: str):
         config = XRayConfig(config, self.connection.peer)
 
-        # Hot path: identical config -> no-op; only client lists changed ->
-        # applied to the live core without dropping user connections. Any
-        # other difference (or hot-path error) falls through to the full
-        # restart below.
-        if self.core is not None and xray_hot_reload.try_hot_reload(self.core, config):
-            self.core.config = config
-            return
+        # restart_lock spans the hot-reload attempt, the fallback full
+        # restart and the core.config update: overlapping restart requests
+        # must not diff against a core.config another thread is still
+        # bringing in sync with the live process.
+        with xray_hot_reload.restart_lock:
+            # Hot path: identical config -> no-op; only client lists
+            # changed -> applied to the live core without dropping user
+            # connections (core.config updated inside). Any other
+            # difference (or hot-path error) falls through to the full
+            # restart below.
+            if self.core is not None and xray_hot_reload.try_hot_reload(self.core, config):
+                return
 
-        self.core.restart(config)
-        self.core.config = config
+            self.core.restart(config)
+            self.core.config = config
 
     @rpyc.exposed
     def fetch_xray_version(self):

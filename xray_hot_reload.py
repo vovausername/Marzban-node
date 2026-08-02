@@ -27,7 +27,15 @@ from logger import logger
 # signal, so it is parsed and compared against the expected count.
 _TOTAL_RE = re.compile(r"(?:Added|Removed) (\d+) user\(s\) in total\.")
 
-_lock = threading.Lock()
+# One synchronization boundary for everything a restart request does:
+# diffing against core.config, mutating the live process (hot or full
+# restart) and storing the new core.config. Both FastAPI's sync handlers
+# and the threaded rpyc server let restart calls overlap, and a second
+# request diffing against a core.config the first one hasn't finished
+# updating would apply a delta computed from stale state. Re-entrant so
+# the service handlers can hold it across try_hot_reload() + their full
+# restart fallback while try_hot_reload() also stays safe standalone.
+restart_lock = threading.RLock()
 
 # xray version string -> whether its CLI has `api adu`/`api rmu`.
 _cli_probe_cache = {}
@@ -188,14 +196,18 @@ def apply_delta(new_config: dict, delta: dict) -> None:
 def try_hot_reload(core, new_config: dict) -> bool:
     """Try to bring the running core to `new_config` without restarting it.
 
-    True means the caller should set core.config = new_config and report
-    success without touching the process (users were hot-applied, or the
-    config was already up to date). False means the caller must do the
-    normal full restart — including after any hot-path error, since the
-    full restart re-applies the complete new config and therefore re-syncs
-    the live state no matter how far the hot path got.
+    True means the config is now in effect and core.config has been
+    updated — the caller reports success without touching the process
+    (users were hot-applied, or the config was already up to date). False
+    means the caller must do the normal full restart — including after any
+    hot-path error, since the full restart re-applies the complete new
+    config and therefore re-syncs the live state no matter how far the hot
+    path got. Callers should hold restart_lock across this call AND their
+    fallback restart + core.config assignment, so overlapping restart
+    requests can't diff against a core.config another thread is still
+    updating.
     """
-    with _lock:
+    with restart_lock:
         if not XRAY_HOT_RELOAD_ENABLED:
             return False
         if not core.started:
@@ -210,6 +222,7 @@ def try_hot_reload(core, new_config: dict) -> bool:
 
         if not delta["added"] and not delta["removed"]:
             logger.info("Config unchanged, skipping Xray restart")
+            core.config = new_config
             return True
 
         if not _cli_supports_user_ops(core.version):
@@ -232,4 +245,5 @@ def try_hot_reload(core, new_config: dict) -> bool:
             f"Hot-reloaded users without restart: +{n_added} -{n_removed} "
             f"on inbound(s) {', '.join(tags)}"
         )
+        core.config = new_config
         return True
