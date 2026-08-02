@@ -5,11 +5,14 @@ from threading import Thread
 import rpyc
 
 import ip_block
+import node_updater
 import system_stats
 import version_check
 import xray_hot_reload
 import xray_updater
-from config import IP_BLOCK_ENABLED, XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH, XRAY_REMOTE_UPDATE_ENABLED
+from config import (IP_BLOCK_ENABLED, NODE_REMOTE_UPDATE_ENABLED,
+                    XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH,
+                    XRAY_REMOTE_UPDATE_ENABLED)
 from logger import logger
 from xray import XRayConfig, XRayCore, get_xray_version
 
@@ -182,6 +185,21 @@ class XrayService(rpyc.Service):
     @rpyc.exposed
     def check_for_update(self) -> dict:
         return version_check.check_for_update()
+
+    @rpyc.exposed
+    def update_node(self, force: bool = False) -> dict:
+        if not NODE_REMOTE_UPDATE_ENABLED:
+            raise PermissionError(
+                "Remote node updates are disabled. Set NODE_REMOTE_UPDATE_ENABLED=true to allow them."
+            )
+        try:
+            return node_updater.request_update(force=force)
+        except node_updater.NodeUpdateError as exc:
+            raise ValueError(str(exc))
+
+    @rpyc.exposed
+    def update_node_status(self) -> dict:
+        return node_updater.get_status()
 
     @rpyc.exposed
     def healthcheck(self) -> dict:
