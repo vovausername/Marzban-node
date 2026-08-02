@@ -3,12 +3,14 @@ import json
 import re
 import subprocess
 import threading
+import time
 from collections import deque
 from contextlib import contextmanager
 
 from config import (DEBUG, SSL_CERT_FILE, SSL_KEY_FILE, XRAY_API_HOST,
                     XRAY_API_PORT, XRAY_HOT_RELOAD_ENABLED,
-                    XRAY_LOCAL_API_PORT, INBOUNDS)
+                    XRAY_LOCAL_API_PORT, XRAY_START_CONFIRM_SECONDS,
+                    XRAY_START_POLL_INTERVAL, INBOUNDS)
 from logger import logger
 
 
@@ -19,6 +21,52 @@ def get_xray_version(executable_path: str):
     m = re.match(r'^Xray (\d+\.\d+\.\d+)', output)
     if m:
         return m.groups()[0]
+
+
+def wait_until_ready(core, timeout: float = None, poll_interval: float = None) -> bool:
+    """Confirm a just-started/restarted core actually stayed up.
+
+    core.start()/restart() only spawn the process and return immediately,
+    so this is the only reliable way to notice a config/binary combination
+    that starts, then dies moments later — replacing per-caller stdout
+    log-scanning, which only ever gated on core.started anyway.
+
+    Polls core.started for up to `timeout` seconds; returns False the
+    instant the process dies. When the loopback API inbound is available
+    (XRAY_HOT_RELOAD_ENABLED), also probes `xray api statssys` on each
+    iteration once the process is alive — a real response there means the
+    gRPC server is actually serving, so success is reported immediately
+    instead of always waiting out the full window. If the API never
+    responds (older binary, feature disabled, or it's simply not up yet by
+    the deadline), core.started at the end of the window is still the
+    final verdict — same behavior as before this probe existed.
+    """
+    if timeout is None:
+        timeout = XRAY_START_CONFIRM_SECONDS
+    if poll_interval is None:
+        poll_interval = XRAY_START_POLL_INTERVAL
+
+    time.sleep(poll_interval)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not core.started:
+            return False
+
+        if XRAY_HOT_RELOAD_ENABLED:
+            # Local import: avoids a hard import cycle at module load time
+            # (xray_hot_reload imports nothing from xray, but keeping this
+            # optional keeps wait_until_ready usable even if that module
+            # ever fails to import for an unrelated reason).
+            import xray_hot_reload
+            try:
+                xray_hot_reload._run_xray_api(["statssys"])
+                return True
+            except xray_hot_reload.HotReloadError:
+                pass
+
+        time.sleep(poll_interval)
+
+    return core.started
 
 
 class XRayConfig(dict):

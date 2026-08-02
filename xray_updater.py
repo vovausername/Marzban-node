@@ -12,20 +12,13 @@ import shutil
 import stat
 import subprocess
 import tempfile
-import time
 import urllib.error
 import urllib.request
 import zipfile
 
 from config import XRAY_EXECUTABLE_PATH
 from logger import logger
-
-# How long to watch a freshly (re)started core before trusting that the new
-# binary/config combination actually stayed up, rather than crashing shortly
-# after XRayCore.start() merely spawned the process. Matches the ~3s window
-# rest_service.py/rpyc_service.py already use when confirming a plain start.
-_START_CONFIRM_SECONDS = 3.0
-_START_POLL_INTERVAL = 0.1
+from xray import wait_until_ready
 
 _RELEASES_BASE = "https://github.com/XTLS/Xray-core/releases/download"
 _ARCH_MAP = {
@@ -88,21 +81,6 @@ def _verify_checksum(asset_bytes: bytes, dgst_text: str, asset_name: str) -> Non
         raise XrayUpdateError(
             f"Checksum mismatch for {asset_name}: expected {expected}, got {actual}"
         )
-
-
-def _wait_for_stable_start(core) -> bool:
-    """Poll core.started for _START_CONFIRM_SECONDS; return whether it's
-    still running at the end. XRayCore.start() only spawns the process and
-    returns immediately, so this is the only way to notice a new
-    binary/config combination that starts, then dies moments later.
-    """
-    time.sleep(_START_POLL_INTERVAL)
-    deadline = time.time() + _START_CONFIRM_SECONDS
-    while time.time() < deadline:
-        if not core.started:
-            return False
-        time.sleep(_START_POLL_INTERVAL)
-    return core.started
 
 
 def update(version: str, core) -> dict:
@@ -184,7 +162,7 @@ def update(version: str, core) -> dict:
             started_ok = False
             try:
                 core.start(config)
-                started_ok = _wait_for_stable_start(core)
+                started_ok = wait_until_ready(core)
             except Exception as exc:
                 logger.error(f"New Xray {version} failed to start: {exc}")
 
