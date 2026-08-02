@@ -58,6 +58,14 @@ XRAY_HOT_RELOAD_ENABLED = config("XRAY_HOT_RELOAD_ENABLED", cast=bool, default=T
 # is the host's loopback: change this if 62052 collides with something.
 XRAY_LOCAL_API_PORT = config("XRAY_LOCAL_API_PORT", cast=int, default=62052)
 
+# How long to watch a freshly (re)started Xray process before trusting that
+# it actually stayed up, and how often to poll it while watching. Used by
+# xray.wait_until_ready() — the single place both service handlers and
+# xray_updater.py confirm a start/restart succeeded, replacing the old
+# per-file hardcoded 3-second windows and fragile stdout log-scanning.
+XRAY_START_CONFIRM_SECONDS = config("XRAY_START_CONFIRM_SECONDS", cast=float, default=3.0)
+XRAY_START_POLL_INTERVAL = config("XRAY_START_POLL_INTERVAL", cast=float, default=0.1)
+
 # Repo whose GitHub Releases are checked for a newer marzban-node version.
 # Used both to answer "is an update available" and as the guard for
 # panel-triggered node updates (node_updater.py refuses to schedule one,

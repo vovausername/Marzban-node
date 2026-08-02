@@ -14,7 +14,7 @@ from config import (IP_BLOCK_ENABLED, NODE_REMOTE_UPDATE_ENABLED,
                     XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH,
                     XRAY_REMOTE_UPDATE_ENABLED)
 from logger import logger
-from xray import XRayConfig, XRayCore, get_xray_version
+from xray import XRayConfig, XRayCore, get_xray_version, wait_until_ready
 
 
 class XrayCoreLogsHandler(object):
@@ -76,70 +76,78 @@ class XrayService(rpyc.Service):
         if conn is self.connection:
             logger.warning(f'Disconnected from {self.connection.peer}')
 
-            if self.core is not None:
-                self.core.stop()
+            # core_lock: a stop() here must not interleave with a
+            # concurrently in-flight start()/stop()/restart() on the same
+            # core.process.
+            with xray_hot_reload.core_lock:
+                if self.core is not None:
+                    self.core.stop()
 
-            self.core = None
+                self.core = None
             self.connection = None
 
     @rpyc.exposed
     def start(self, config: str):
-        if self.core is not None:
-            self.stop()
+        with xray_hot_reload.core_lock:
+            if self.core is not None:
+                self.stop()
 
-        try:
-            config = XRayConfig(config, self.connection.peer)
-            self.core = XRayCore(executable_path=XRAY_EXECUTABLE_PATH,
-                                 assets_path=XRAY_ASSETS_PATH)
+            try:
+                config = XRayConfig(config, self.connection.peer)
+                self.core = XRayCore(executable_path=XRAY_EXECUTABLE_PATH,
+                                     assets_path=XRAY_ASSETS_PATH)
 
-            if self.connection and hasattr(self.connection.root, 'on_start'):
-                @self.core.on_start
-                def on_start():
-                    try:
-                        if self.connection:
-                            self.connection.root.on_start()
-                    except Exception as exc:
-                        logger.debug('Peer on_start exception:', exc)
-            else:
-                logger.debug(
-                    "Peer doesn't have on_start function on it's service, skipped")
+                if self.connection and hasattr(self.connection.root, 'on_start'):
+                    @self.core.on_start
+                    def on_start():
+                        try:
+                            if self.connection:
+                                self.connection.root.on_start()
+                        except Exception as exc:
+                            logger.debug('Peer on_start exception:', exc)
+                else:
+                    logger.debug(
+                        "Peer doesn't have on_start function on it's service, skipped")
 
-            if self.connection and hasattr(self.connection.root, 'on_stop'):
-                @self.core.on_stop
-                def on_stop():
-                    try:
-                        if self.connection:
-                            self.connection.root.on_stop()
-                    except Exception as exc:
-                        logger.debug('Peer on_stop exception:', exc)
-            else:
-                logger.debug(
-                    "Peer doesn't have on_stop function on it's service, skipped")
+                if self.connection and hasattr(self.connection.root, 'on_stop'):
+                    @self.core.on_stop
+                    def on_stop():
+                        try:
+                            if self.connection:
+                                self.connection.root.on_stop()
+                        except Exception as exc:
+                            logger.debug('Peer on_stop exception:', exc)
+                else:
+                    logger.debug(
+                        "Peer doesn't have on_stop function on it's service, skipped")
 
-            self.core.start(config)
-            self.core.config = config
-        except Exception as exc:
-            logger.error(exc)
-            raise exc
+                self.core.start(config)
+                if not wait_until_ready(self.core):
+                    raise RuntimeError("Xray failed to start or didn't stay running")
+                self.core.config = config
+            except Exception as exc:
+                logger.error(exc)
+                raise exc
 
     @rpyc.exposed
     def stop(self):
-        if self.core:
-            try:
-                self.core.stop()
-            except RuntimeError:
-                pass
-        self.core = None
+        with xray_hot_reload.core_lock:
+            if self.core:
+                try:
+                    self.core.stop()
+                except RuntimeError:
+                    pass
+            self.core = None
 
     @rpyc.exposed
     def restart(self, config: str):
         config = XRayConfig(config, self.connection.peer)
 
-        # restart_lock spans the hot-reload attempt, the fallback full
+        # core_lock spans the hot-reload attempt, the fallback full
         # restart and the core.config update: overlapping restart requests
         # must not diff against a core.config another thread is still
         # bringing in sync with the live process.
-        with xray_hot_reload.restart_lock:
+        with xray_hot_reload.core_lock:
             # Hot path: identical config -> no-op; only client lists
             # changed -> applied to the live core without dropping user
             # connections (core.config updated inside). Any other
@@ -149,6 +157,8 @@ class XrayService(rpyc.Service):
                 return
 
             self.core.restart(config)
+            if not wait_until_ready(self.core):
+                raise RuntimeError("Xray failed to restart or didn't stay running")
             self.core.config = config
 
     @rpyc.exposed

@@ -3,12 +3,14 @@ import json
 import re
 import subprocess
 import threading
+import time
 from collections import deque
 from contextlib import contextmanager
 
 from config import (DEBUG, SSL_CERT_FILE, SSL_KEY_FILE, XRAY_API_HOST,
                     XRAY_API_PORT, XRAY_HOT_RELOAD_ENABLED,
-                    XRAY_LOCAL_API_PORT, INBOUNDS)
+                    XRAY_LOCAL_API_PORT, XRAY_START_CONFIRM_SECONDS,
+                    XRAY_START_POLL_INTERVAL, INBOUNDS)
 from logger import logger
 
 
@@ -19,6 +21,40 @@ def get_xray_version(executable_path: str):
     m = re.match(r'^Xray (\d+\.\d+\.\d+)', output)
     if m:
         return m.groups()[0]
+
+
+def wait_until_ready(core, timeout: float = None, poll_interval: float = None) -> bool:
+    """Confirm a just-started/restarted core actually stayed up for the
+    whole confirmation window — not merely that it came up at some point.
+
+    core.start()/restart() only spawn the process and return immediately,
+    so this is the only reliable way to notice a config/binary combination
+    that starts, then dies moments later — replacing per-caller stdout
+    log-scanning, which only ever gated on core.started anyway.
+
+    Polls core.started for the full `timeout` seconds and returns False
+    the instant the process dies — but never returns True before the
+    window elapses. Returning early on any positive signal (e.g. the
+    first successful response from Xray's own API) would let a
+    binary/config that comes up, serves briefly, then crashes a moment
+    later slip through as "ready": xray_updater.py's rollback safety net
+    specifically depends on this window to catch exactly that case, and
+    declaring success early would delete the backup binary before a
+    delayed crash had a chance to show up.
+    """
+    if timeout is None:
+        timeout = XRAY_START_CONFIRM_SECONDS
+    if poll_interval is None:
+        poll_interval = XRAY_START_POLL_INTERVAL
+
+    time.sleep(poll_interval)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not core.started:
+            return False
+        time.sleep(poll_interval)
+
+    return core.started
 
 
 class XRayConfig(dict):

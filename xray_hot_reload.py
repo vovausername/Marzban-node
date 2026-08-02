@@ -27,15 +27,18 @@ from logger import logger
 # signal, so it is parsed and compared against the expected count.
 _TOTAL_RE = re.compile(r"(?:Added|Removed) (\d+) user\(s\) in total\.")
 
-# One synchronization boundary for everything a restart request does:
-# diffing against core.config, mutating the live process (hot or full
-# restart) and storing the new core.config. Both FastAPI's sync handlers
-# and the threaded rpyc server let restart calls overlap, and a second
-# request diffing against a core.config the first one hasn't finished
-# updating would apply a delta computed from stale state. Re-entrant so
-# the service handlers can hold it across try_hot_reload() + their full
-# restart fallback while try_hot_reload() also stays safe standalone.
-restart_lock = threading.RLock()
+# One synchronization boundary around every mutation of the live core:
+# connect/disconnect/start/stop/restart, hot-reload's diff against
+# core.config, and the core.config assignment that follows any of them.
+# Both FastAPI's sync handlers (run in a threadpool) and the threaded rpyc
+# server let these calls overlap, and two of them interleaving on the same
+# core.process — or a restart diffing against a core.config another
+# request hasn't finished updating — can leave the node's idea of its own
+# state out of sync with the actual live process. Re-entrant so callers
+# can hold it across a whole multi-step operation (e.g. try_hot_reload()
+# plus its full-restart fallback) while try_hot_reload() also stays safe
+# called standalone.
+core_lock = threading.RLock()
 
 # xray version string -> whether its CLI has `api adu`/`api rmu`.
 _cli_probe_cache = {}
@@ -202,12 +205,12 @@ def try_hot_reload(core, new_config: dict) -> bool:
     means the caller must do the normal full restart — including after any
     hot-path error, since the full restart re-applies the complete new
     config and therefore re-syncs the live state no matter how far the hot
-    path got. Callers should hold restart_lock across this call AND their
+    path got. Callers should hold core_lock across this call AND their
     fallback restart + core.config assignment, so overlapping restart
     requests can't diff against a core.config another thread is still
     updating.
     """
-    with restart_lock:
+    with core_lock:
         if not XRAY_HOT_RELOAD_ENABLED:
             return False
         if not core.started:
