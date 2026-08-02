@@ -222,7 +222,7 @@ class Service(object):
         self,
         session_id: UUID = Body(embed=True),
         ip: str = Body(embed=True),
-        minutes: int = Body(embed=True),
+        minutes: float = Body(embed=True),
     ):
         self.match_session_id(session_id)
         if not IP_BLOCK_ENABLED:

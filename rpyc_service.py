@@ -140,7 +140,7 @@ class XrayService(rpyc.Service):
         return self.core.version
 
     @rpyc.exposed
-    def block_ip(self, ip: str, minutes: int) -> dict:
+    def block_ip(self, ip: str, minutes: float) -> dict:
         if not IP_BLOCK_ENABLED:
             raise PermissionError(
                 "IP blocking is disabled. Set IP_BLOCK_ENABLED=true to allow it."
