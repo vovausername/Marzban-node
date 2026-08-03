@@ -248,12 +248,17 @@ class Service(object):
                 status_code=403,
                 detail="Remote Xray updates are disabled. Set XRAY_REMOTE_UPDATE_ENABLED=true to allow them.",
             )
-        try:
-            result = xray_updater.update(version, self.core)
-        except xray_updater.XrayUpdateError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        self.core_version = self.core.version
-        return result
+        # core_lock: xray_updater.update() stops and restarts self.core
+        # internally, same as restart() — it must not interleave with a
+        # concurrent connect/disconnect/start/stop/restart touching the
+        # same core.process.
+        with xray_hot_reload.core_lock:
+            try:
+                result = xray_updater.update(version, self.core)
+            except xray_updater.XrayUpdateError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            self.core_version = self.core.version
+            return result
 
     def check_for_update(self, session_id: UUID = Body(embed=True)):
         self.match_session_id(session_id)

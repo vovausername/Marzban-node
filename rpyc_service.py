@@ -185,12 +185,17 @@ class XrayService(rpyc.Service):
             raise PermissionError(
                 "Remote Xray updates are disabled. Set XRAY_REMOTE_UPDATE_ENABLED=true to allow them."
             )
-        if self.core is None:
-            raise ProcessLookupError("Xray has not been started")
-        try:
-            return xray_updater.update(version, self.core)
-        except xray_updater.XrayUpdateError as exc:
-            raise ValueError(str(exc))
+        # core_lock: xray_updater.update() stops and restarts self.core
+        # internally, same as restart() — it must not interleave with a
+        # concurrent connect/disconnect/start/stop/restart touching the
+        # same core.process.
+        with xray_hot_reload.core_lock:
+            if self.core is None:
+                raise ProcessLookupError("Xray has not been started")
+            try:
+                return xray_updater.update(version, self.core)
+            except xray_updater.XrayUpdateError as exc:
+                raise ValueError(str(exc))
 
     @rpyc.exposed
     def check_for_update(self) -> dict:
