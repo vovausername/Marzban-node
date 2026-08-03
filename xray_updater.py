@@ -83,17 +83,34 @@ def _verify_checksum(asset_bytes: bytes, dgst_text: str, asset_name: str) -> Non
         )
 
 
-def update(version: str, core) -> dict:
-    """Download Xray `version`, verify it, atomically replace the binary,
-    then restart `core` with its own last-applied config if it was running.
+class PreparedUpdate:
+    """A downloaded, checksum-verified, sanity-checked Xray binary staged
+    in a temp directory, ready for apply() to swap in. Holding one keeps
+    its temp directory alive; if it's never passed to apply() (e.g. the
+    caller decides not to proceed after fetch_and_verify() succeeds),
+    call .cleanup() explicitly to remove the temp directory."""
 
-    `core` is the XRayCore instance the caller is managing; it must expose
-    .version, .started, .config (last config passed to start/restart),
-    .get_version(), .stop() and .start(config).
+    def __init__(self, version: str, tmp_dir: tempfile.TemporaryDirectory, binary_path: str):
+        self.version = version
+        self._tmp_dir = tmp_dir
+        self.binary_path = binary_path
 
-    Returns {"previous_version", "new_version"}. Raises XrayUpdateError on
-    any failure — including a downloaded binary that won't start — after
-    rolling back to the previously-installed binary.
+    def cleanup(self) -> None:
+        self._tmp_dir.cleanup()
+
+
+def fetch_and_verify(version: str) -> PreparedUpdate:
+    """Download Xray `version`, verify its checksum, and confirm the
+    extracted binary actually runs — entirely independent of any running
+    core. Deliberately separate from apply(): this step is pure network
+    I/O plus local verification, so it must run WITHOUT the caller's
+    core_lock — holding that lock for as long as GitHub takes to respond
+    would block every other core-mutating request (connect, disconnect,
+    start, stop, restart) for the same duration, even though none of them
+    touch anything this step reads or writes.
+
+    Raises XrayUpdateError on any failure. Returns a PreparedUpdate to
+    pass to apply().
     """
     version = _validate_version(version)
     asset_name = _xray_asset_name()
@@ -104,26 +121,22 @@ def update(version: str, core) -> dict:
     dgst_text = _fetch(f"{base_url}/{asset_name}.dgst").decode()
     _verify_checksum(asset_bytes, dgst_text, asset_name)
 
-    previous_version = core.version
-    was_started = core.started
-    config = getattr(core, "config", None)
-    backup_path = f"{XRAY_EXECUTABLE_PATH}.bak"
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        zip_path = os.path.join(tmp_dir, asset_name)
+    tmp_dir = tempfile.TemporaryDirectory()
+    try:
+        zip_path = os.path.join(tmp_dir.name, asset_name)
         with open(zip_path, "wb") as f:
             f.write(asset_bytes)
 
         with zipfile.ZipFile(zip_path) as zf:
-            zf.extract("xray", tmp_dir)
+            zf.extract("xray", tmp_dir.name)
 
-        new_binary_path = os.path.join(tmp_dir, "xray")
-        os.chmod(new_binary_path, os.stat(new_binary_path).st_mode | stat.S_IEXEC)
+        binary_path = os.path.join(tmp_dir.name, "xray")
+        os.chmod(binary_path, os.stat(binary_path).st_mode | stat.S_IEXEC)
 
         # Sanity-check the new binary actually runs before touching the live one.
         try:
             output = subprocess.check_output(
-                [new_binary_path, "version"], stderr=subprocess.STDOUT, timeout=10
+                [binary_path, "version"], stderr=subprocess.STDOUT, timeout=10
             ).decode()
         except Exception as exc:
             raise XrayUpdateError(f"Downloaded binary failed to run: {exc}")
@@ -131,7 +144,36 @@ def update(version: str, core) -> dict:
             raise XrayUpdateError(
                 f"Downloaded binary reports unexpected version (wanted {version}): {output.strip()}"
             )
+    except Exception:
+        tmp_dir.cleanup()
+        raise
 
+    return PreparedUpdate(version, tmp_dir, binary_path)
+
+
+def apply(prepared: PreparedUpdate, core) -> dict:
+    """Swap in a PreparedUpdate's binary, then restart `core` with its own
+    last-applied config if it was running, rolling back to the previous
+    binary on any failure.
+
+    `core` is the XRayCore instance the caller is managing; it must expose
+    .version, .started, .config (last config passed to start/restart),
+    .get_version(), .stop() and .start(config). Everything here touches
+    shared state (the installed binary, `core`), so the caller MUST hold
+    its core_lock across this call.
+
+    Returns {"previous_version", "new_version"}. Raises XrayUpdateError on
+    any failure — including a downloaded binary that won't start — after
+    rolling back to the previously-installed binary. Always consumes
+    (cleans up) `prepared`, success or failure.
+    """
+    version = prepared.version
+    previous_version = core.version
+    was_started = core.started
+    config = getattr(core, "config", None)
+    backup_path = f"{XRAY_EXECUTABLE_PATH}.bak"
+
+    try:
         # Back up the currently-installed binary *before* stopping the core
         # or touching anything live. If this fails (full disk, permissions,
         # a stale file occupying backup_path, ...), abort here: the running
@@ -146,12 +188,14 @@ def update(version: str, core) -> dict:
             core.stop()
 
         try:
-            shutil.move(new_binary_path, XRAY_EXECUTABLE_PATH)
+            shutil.move(prepared.binary_path, XRAY_EXECUTABLE_PATH)
         except OSError as exc:
             shutil.move(backup_path, XRAY_EXECUTABLE_PATH)
             if was_started:
                 core.start(config)
             raise XrayUpdateError(f"Failed to install new binary: {exc}")
+    finally:
+        prepared.cleanup()
 
     core.version = core.get_version()
 
