@@ -6,9 +6,16 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /code
 
+# Pinned rather than "latest" so builds are reproducible and never drift
+# below what this fork's features need: xray_hot_reload.py requires
+# `xray api adu`/`rmu`, shipped starting v25.7.26. v26.5.9 is verified
+# (manually, against a real binary) to work with hot reload, the
+# readiness check, and the remote-update path.
+ARG XRAY_VERSION=v26.5.9
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential curl unzip gcc python3-dev libpq-dev \
-    && curl -L https://github.com/Gozargah/Marzban-scripts/raw/master/install_latest_xray.sh | bash \
+    && curl -L https://github.com/Gozargah/Marzban-scripts/raw/master/install_latest_xray.sh | bash -s -- "$XRAY_VERSION" \
     && rm -rf /var/lib/apt/lists/*
 
 COPY ./requirements.txt /code/
