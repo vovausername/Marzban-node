@@ -248,13 +248,24 @@ class Service(object):
                 status_code=403,
                 detail="Remote Xray updates are disabled. Set XRAY_REMOTE_UPDATE_ENABLED=true to allow them.",
             )
-        # core_lock: xray_updater.update() stops and restarts self.core
+        # Download + verify without core_lock: pure network I/O and local
+        # checks, independent of the running core. Holding the lock for
+        # as long as GitHub takes to respond would block every other
+        # core-mutating request (connect/disconnect/start/stop/restart)
+        # for the same duration, even though none of them touch anything
+        # this step reads or writes.
+        try:
+            prepared = xray_updater.fetch_and_verify(version)
+        except xray_updater.XrayUpdateError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        # core_lock: applying the update stops and restarts self.core
         # internally, same as restart() — it must not interleave with a
         # concurrent connect/disconnect/start/stop/restart touching the
         # same core.process.
         with xray_hot_reload.core_lock:
             try:
-                result = xray_updater.update(version, self.core)
+                result = xray_updater.apply(prepared, self.core)
             except xray_updater.XrayUpdateError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
             self.core_version = self.core.version
