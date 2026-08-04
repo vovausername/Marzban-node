@@ -163,6 +163,28 @@ def fetch_and_verify(version: str) -> PreparedUpdate:
     return PreparedUpdate(version, tmp_dir, binary_path)
 
 
+def _tail_logs(core, n: int = 20) -> str:
+    """Best-effort last `n` lines of the core's captured output.
+
+    The background thread reading the process's stdout can still be
+    appending to this same deque while the process is exiting, which can
+    make a bare list()/iteration over it raise "deque mutated during
+    iteration". Callers use this right before a rollback that must not be
+    skipped, so any failure here — including repeated mutation — is
+    swallowed and yields an empty string rather than propagating.
+    """
+    try:
+        with core.get_logs() as logs:
+            for _ in range(5):
+                try:
+                    return "\n".join(list(logs)[-n:])
+                except RuntimeError:
+                    continue
+    except Exception:
+        pass
+    return ""
+
+
 def apply(prepared: PreparedUpdate, core) -> dict:
     """Swap in a PreparedUpdate's binary, then restart `core` with its own
     last-applied config if it was running, rolling back to the previous
@@ -231,8 +253,7 @@ def apply(prepared: PreparedUpdate, core) -> dict:
                 # Grab a snapshot of the new binary's own output before the
                 # rollback below starts the old binary and its log lines
                 # start filling the same buffer.
-                with core.get_logs() as logs:
-                    crash_log = "\n".join(list(logs)[-20:])
+                crash_log = _tail_logs(core)
 
                 logger.error(
                     f"New Xray {version} failed to start or didn't stay running; "
