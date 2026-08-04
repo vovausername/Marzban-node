@@ -228,6 +228,12 @@ def apply(prepared: PreparedUpdate, core) -> dict:
                 logger.error(f"New Xray {version} failed to start: {exc}")
 
             if not started_ok:
+                # Grab a snapshot of the new binary's own output before the
+                # rollback below starts the old binary and its log lines
+                # start filling the same buffer.
+                with core.get_logs() as logs:
+                    crash_log = "\n".join(list(logs)[-20:])
+
                 logger.error(
                     f"New Xray {version} failed to start or didn't stay running; "
                     f"rolling back to {previous_version}"
@@ -235,8 +241,9 @@ def apply(prepared: PreparedUpdate, core) -> dict:
                 shutil.move(backup_path, XRAY_EXECUTABLE_PATH)
                 core.version = core.get_version()
                 core.start(config)
+                detail = f"; last output:\n{crash_log}" if crash_log else ""
                 raise XrayUpdateError(
-                    f"New version failed to start or stay running, rolled back to {previous_version}"
+                    f"New version failed to start or stay running, rolled back to {previous_version}{detail}"
                 )
 
     if os.path.exists(backup_path):
