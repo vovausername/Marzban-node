@@ -121,7 +121,15 @@ def fetch_and_verify(version: str) -> PreparedUpdate:
     dgst_text = _fetch(f"{base_url}/{asset_name}.dgst").decode()
     _verify_checksum(asset_bytes, dgst_text, asset_name)
 
-    tmp_dir = tempfile.TemporaryDirectory()
+    # Stage the download in the SAME directory (and therefore filesystem)
+    # as XRAY_EXECUTABLE_PATH, not the default /tmp: on the typical Docker
+    # deployment /tmp is the container's overlay filesystem while
+    # XRAY_EXECUTABLE_PATH lives on a bind-mounted volume, so a plain
+    # tempfile.TemporaryDirectory() forces apply()'s final swap onto a
+    # cross-device copy (EXDEV) that has to open() the live executable for
+    # writing instead of an atomic same-filesystem rename() — the former
+    # is what can raise "Text file busy", the latter never does.
+    tmp_dir = tempfile.TemporaryDirectory(dir=os.path.dirname(XRAY_EXECUTABLE_PATH))
     try:
         zip_path = os.path.join(tmp_dir.name, asset_name)
         with open(zip_path, "wb") as f:
@@ -188,7 +196,12 @@ def apply(prepared: PreparedUpdate, core) -> dict:
             core.stop()
 
         try:
-            shutil.move(prepared.binary_path, XRAY_EXECUTABLE_PATH)
+            # os.replace() is an atomic rename within the same filesystem
+            # (guaranteed by staging the download alongside XRAY_EXECUTABLE_PATH
+            # in fetch_and_verify) — unlike a copy, it never opens the live
+            # executable for writing, so it cannot raise "Text file busy"
+            # even if the old process hasn't fully exited yet.
+            os.replace(prepared.binary_path, XRAY_EXECUTABLE_PATH)
         except OSError as exc:
             shutil.move(backup_path, XRAY_EXECUTABLE_PATH)
             if was_started:
