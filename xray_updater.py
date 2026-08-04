@@ -163,6 +163,28 @@ def fetch_and_verify(version: str) -> PreparedUpdate:
     return PreparedUpdate(version, tmp_dir, binary_path)
 
 
+def _tail_logs(core, n: int = 20) -> str:
+    """Best-effort last `n` lines of the core's captured output.
+
+    The background thread reading the process's stdout can still be
+    appending to this same deque while the process is exiting, which can
+    make a bare list()/iteration over it raise "deque mutated during
+    iteration". Callers use this right before a rollback that must not be
+    skipped, so any failure here — including repeated mutation — is
+    swallowed and yields an empty string rather than propagating.
+    """
+    try:
+        with core.get_logs() as logs:
+            for _ in range(5):
+                try:
+                    return "\n".join(list(logs)[-n:])
+                except RuntimeError:
+                    continue
+    except Exception:
+        pass
+    return ""
+
+
 def apply(prepared: PreparedUpdate, core) -> dict:
     """Swap in a PreparedUpdate's binary, then restart `core` with its own
     last-applied config if it was running, rolling back to the previous
@@ -228,6 +250,11 @@ def apply(prepared: PreparedUpdate, core) -> dict:
                 logger.error(f"New Xray {version} failed to start: {exc}")
 
             if not started_ok:
+                # Grab a snapshot of the new binary's own output before the
+                # rollback below starts the old binary and its log lines
+                # start filling the same buffer.
+                crash_log = _tail_logs(core)
+
                 logger.error(
                     f"New Xray {version} failed to start or didn't stay running; "
                     f"rolling back to {previous_version}"
@@ -235,8 +262,9 @@ def apply(prepared: PreparedUpdate, core) -> dict:
                 shutil.move(backup_path, XRAY_EXECUTABLE_PATH)
                 core.version = core.get_version()
                 core.start(config)
+                detail = f"; last output:\n{crash_log}" if crash_log else ""
                 raise XrayUpdateError(
-                    f"New version failed to start or stay running, rolled back to {previous_version}"
+                    f"New version failed to start or stay running, rolled back to {previous_version}{detail}"
                 )
 
     if os.path.exists(backup_path):
