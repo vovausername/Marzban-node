@@ -129,7 +129,11 @@ def fetch_and_verify(version: str) -> PreparedUpdate:
     # cross-device copy (EXDEV) that has to open() the live executable for
     # writing instead of an atomic same-filesystem rename() — the former
     # is what can raise "Text file busy", the latter never does.
-    tmp_dir = tempfile.TemporaryDirectory(dir=os.path.dirname(XRAY_EXECUTABLE_PATH))
+    try:
+        tmp_dir = tempfile.TemporaryDirectory(dir=os.path.dirname(XRAY_EXECUTABLE_PATH))
+    except OSError as exc:
+        raise XrayUpdateError(f"Could not stage update next to {XRAY_EXECUTABLE_PATH}: {exc}")
+
     try:
         zip_path = os.path.join(tmp_dir.name, asset_name)
         with open(zip_path, "wb") as f:
