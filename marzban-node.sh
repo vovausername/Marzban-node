@@ -25,6 +25,10 @@ while [[ $# -gt 0 ]]; do
             fi
             shift # past value
         ;;
+        -y|--yes)
+            ASSUME_YES="true"
+            shift # past argument
+        ;;
         *)
             shift # past unknown argument
         ;;
@@ -1014,7 +1018,11 @@ migrate_command() {
         colorized_echo green "Already on this fork's image."
     fi
 
-    read -p "Enable this fork's remote-control triggers (remote Xray update + IP blocking)? (Y/n): " -r enable_triggers
+    if [[ "$ASSUME_YES" == "true" ]]; then
+        enable_triggers="y"
+    else
+        read -p "Enable this fork's remote-control triggers (remote Xray update + IP blocking)? (Y/n): " -r enable_triggers
+    fi
     if [[ -z "$enable_triggers" || "$enable_triggers" =~ ^[Yy]$ ]]; then
         yq eval '.services."marzban-node".environment.XRAY_REMOTE_UPDATE_ENABLED = "true"' -i "$COMPOSE_FILE"
         yq eval '.services."marzban-node".environment.IP_BLOCK_ENABLED = "true"' -i "$COMPOSE_FILE"
@@ -1026,7 +1034,11 @@ migrate_command() {
         colorized_echo yellow "Remote-control triggers left disabled. Re-run '$APP_NAME migrate' anytime to turn them on."
     fi
 
-    read -p "Also allow the panel to update this node itself (installs a host-side watcher)? (Y/n): " -r enable_node_update
+    if [[ "$ASSUME_YES" == "true" ]]; then
+        enable_node_update="y"
+    else
+        read -p "Also allow the panel to update this node itself (installs a host-side watcher)? (Y/n): " -r enable_node_update
+    fi
     if [[ -z "$enable_node_update" || "$enable_node_update" =~ ^[Yy]$ ]]; then
         yq eval '.services."marzban-node".environment.NODE_REMOTE_UPDATE_ENABLED = "true"' -i "$COMPOSE_FILE"
         install_node_updater
@@ -1374,7 +1386,7 @@ usage() {
     colorized_echo magenta "       $APP_NAME Node CLI Help"
     colorized_echo blue "================================"
     colorized_echo cyan "Usage:"
-    echo "  $APP_NAME [command]"
+    echo "  $APP_NAME [command] [-y|--yes]"
     echo
 
     colorized_echo cyan "Commands:"
@@ -1385,7 +1397,7 @@ usage() {
     colorized_echo yellow "  logs            $(tput sgr0)– Show logs"
     colorized_echo yellow "  install         $(tput sgr0)– Install/reinstall Marzban-node"
     colorized_echo yellow "  update          $(tput sgr0)– Update to latest version"
-    colorized_echo yellow "  migrate         $(tput sgr0)– Switch an existing node to this fork's image + triggers"
+    colorized_echo yellow "  migrate         $(tput sgr0)– Switch an existing node to this fork's image + triggers (add -y/--yes to accept all prompts)"
     colorized_echo yellow "  uninstall       $(tput sgr0)– Uninstall Marzban-node"
     colorized_echo yellow "  install-script  $(tput sgr0)– Install Marzban-node script"
     colorized_echo yellow "  uninstall-script  $(tput sgr0)– Uninstall Marzban-node script"
