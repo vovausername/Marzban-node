@@ -19,8 +19,9 @@ import re
 import subprocess
 import threading
 
-from config import (XRAY_EXECUTABLE_PATH, XRAY_HOT_ADD_TIMEOUT_SECONDS,
-                    XRAY_HOT_RELOAD_ENABLED, XRAY_LOCAL_API_PORT)
+from config import (INBOUNDS, XRAY_EXECUTABLE_PATH,
+                    XRAY_HOT_ADD_TIMEOUT_SECONDS, XRAY_HOT_RELOAD_ENABLED,
+                    XRAY_LOCAL_API_PORT)
 from logger import logger
 
 # `adu`/`rmu` print per-user errors but still exit 0; the trailing
@@ -176,9 +177,19 @@ def add_inbound(core, inbound: dict) -> str:
     """Hot-add a single inbound to the running Xray process via `xray api
     adi` against the loopback plaintext API inbound — no restart, so
     existing connections on every other inbound are undisturbed. Raises
-    HotReloadError (duplicate tag, Xray unreachable, ...) carrying the
-    CLI's own stderr text as the message. On success, records the addition
-    onto core.config (see _record_added_entry)."""
+    HotReloadError (duplicate tag, Xray unreachable, tag outside the
+    configured INBOUNDS allowlist, ...) carrying the CLI's own stderr text
+    (or an allowlist message) as the message. On success, records the
+    addition onto core.config (see _record_added_entry).
+
+    Enforces INBOUNDS itself: unlike /start and /restart, this doesn't go
+    through XRayConfig._apply_api(), which is the only other place that
+    filter is applied — without this check an operator's INBOUNDS
+    allowlist would be silently bypassable through this endpoint."""
+    if INBOUNDS and inbound.get("tag") not in INBOUNDS:
+        raise HotReloadError(
+            f"inbound tag {inbound.get('tag')!r} is not in the configured INBOUNDS allowlist"
+        )
     output = _run_xray_api(
         ["adi", "stdin:"],
         payload=json.dumps({"inbounds": [inbound]}),

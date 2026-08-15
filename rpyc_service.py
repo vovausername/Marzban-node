@@ -185,6 +185,8 @@ class XrayService(rpyc.Service):
             raise PermissionError(
                 "Xray hot reload is disabled. Set XRAY_HOT_RELOAD_ENABLED=true to allow it."
             )
+        if self.core is None:
+            raise ProcessLookupError("Xray has not been started")
         with xray_hot_reload.core_lock:
             try:
                 return xray_hot_reload.add_inbound(self.core, inbound)
@@ -197,6 +199,8 @@ class XrayService(rpyc.Service):
             raise PermissionError(
                 "Xray hot reload is disabled. Set XRAY_HOT_RELOAD_ENABLED=true to allow it."
             )
+        if self.core is None:
+            raise ProcessLookupError("Xray has not been started")
         with xray_hot_reload.core_lock:
             try:
                 return xray_hot_reload.add_outbound(self.core, outbound)

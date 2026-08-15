@@ -254,6 +254,8 @@ class Service(object):
         # loopback API, which must not be dialed mid-stop/restart while
         # another request is bringing the process down or back up.
         with xray_hot_reload.core_lock:
+            if not self.core.started:
+                raise HTTPException(status_code=503, detail="Xray has not been started")
             try:
                 output = xray_hot_reload.add_inbound(self.core, inbound)
             except xray_hot_reload.HotReloadError as exc:
@@ -268,6 +270,8 @@ class Service(object):
                 detail="Xray hot reload is disabled. Set XRAY_HOT_RELOAD_ENABLED=true to allow it.",
             )
         with xray_hot_reload.core_lock:
+            if not self.core.started:
+                raise HTTPException(status_code=503, detail="Xray has not been started")
             try:
                 output = xray_hot_reload.add_outbound(self.core, outbound)
             except xray_hot_reload.HotReloadError as exc:
