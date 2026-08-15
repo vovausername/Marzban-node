@@ -208,6 +208,34 @@ class XrayService(rpyc.Service):
                 raise ValueError(str(exc))
 
     @rpyc.exposed
+    def remove_inbound(self, tag: str) -> str:
+        if not XRAY_HOT_RELOAD_ENABLED:
+            raise PermissionError(
+                "Xray hot reload is disabled. Set XRAY_HOT_RELOAD_ENABLED=true to allow it."
+            )
+        if self.core is None:
+            raise ProcessLookupError("Xray has not been started")
+        with xray_hot_reload.core_lock:
+            try:
+                return xray_hot_reload.remove_inbound(self.core, tag)
+            except xray_hot_reload.HotReloadError as exc:
+                raise ValueError(str(exc))
+
+    @rpyc.exposed
+    def remove_outbound(self, tag: str) -> str:
+        if not XRAY_HOT_RELOAD_ENABLED:
+            raise PermissionError(
+                "Xray hot reload is disabled. Set XRAY_HOT_RELOAD_ENABLED=true to allow it."
+            )
+        if self.core is None:
+            raise ProcessLookupError("Xray has not been started")
+        with xray_hot_reload.core_lock:
+            try:
+                return xray_hot_reload.remove_outbound(self.core, tag)
+            except xray_hot_reload.HotReloadError as exc:
+                raise ValueError(str(exc))
+
+    @rpyc.exposed
     def update_xray(self, version: str) -> dict:
         if not XRAY_REMOTE_UPDATE_ENABLED:
             raise PermissionError(

@@ -210,6 +210,50 @@ def add_outbound(core, outbound: dict) -> str:
     return output
 
 
+def _record_removed_entry(core, key: str, tag: str) -> None:
+    """Drop the entry tagged `tag` from core.config[key] — the inverse of
+    _record_added_entry(). Without this, core.config would keep claiming a
+    handler is running after it's actually been removed: update_xray()
+    would resurrect it on the next rebuild, and a later restart carrying
+    the panel's config (which never had it) would see a spurious
+    structural diff instead of matching."""
+    config = getattr(core, "config", None)
+    if config is None:
+        return
+    entries = config.get(key)
+    if not isinstance(entries, list):
+        return
+    config[key] = [entry for entry in entries if entry.get("tag") != tag]
+
+
+# Tags xray.py's XRayConfig._apply_api() injects for the node's own control
+# channel. Removing either would cut off the `xray api` CLI (and, for the
+# TLS one, the panel's own connection) — refused outright rather than left
+# to whatever error Xray happens to raise.
+_PROTECTED_INBOUND_TAGS = frozenset({"API_INBOUND", "API_INBOUND_LOCAL"})
+
+
+def remove_inbound(core, tag: str) -> str:
+    """Hot-remove a single inbound by tag via `xray api rmi` — no restart,
+    existing connections on every other inbound are undisturbed. Raises
+    HotReloadError (unknown tag, Xray unreachable, protected tag, ...)
+    carrying the CLI's own stderr text (or a protection message) as the
+    message. On success, drops the entry from core.config (see
+    _record_removed_entry)."""
+    if tag in _PROTECTED_INBOUND_TAGS:
+        raise HotReloadError(f"refusing to remove protected inbound tag {tag!r}")
+    output = _run_xray_api(["rmi", tag], timeout=XRAY_HOT_ADD_TIMEOUT_SECONDS)
+    _record_removed_entry(core, "inbounds", tag)
+    return output
+
+
+def remove_outbound(core, tag: str) -> str:
+    """Same as remove_inbound() but for outbounds, via `xray api rmo`."""
+    output = _run_xray_api(["rmo", tag], timeout=XRAY_HOT_ADD_TIMEOUT_SECONDS)
+    _record_removed_entry(core, "outbounds", tag)
+    return output
+
+
 def _expect_total(stdout: str, expected: int, operation: str) -> None:
     m = _TOTAL_RE.search(stdout)
     if not m or int(m.group(1)) != expected:
