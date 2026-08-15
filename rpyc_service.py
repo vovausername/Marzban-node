@@ -187,7 +187,7 @@ class XrayService(rpyc.Service):
             )
         with xray_hot_reload.core_lock:
             try:
-                return xray_hot_reload.add_inbound(inbound)
+                return xray_hot_reload.add_inbound(self.core, inbound)
             except xray_hot_reload.HotReloadError as exc:
                 raise ValueError(str(exc))
 
@@ -199,7 +199,7 @@ class XrayService(rpyc.Service):
             )
         with xray_hot_reload.core_lock:
             try:
-                return xray_hot_reload.add_outbound(outbound)
+                return xray_hot_reload.add_outbound(self.core, outbound)
             except xray_hot_reload.HotReloadError as exc:
                 raise ValueError(str(exc))
 

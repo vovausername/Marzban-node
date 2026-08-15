@@ -159,26 +159,44 @@ def _run_xray_api(args: list, payload: str = None, timeout: int = 3) -> str:
     return result.stdout
 
 
-def add_inbound(inbound: dict) -> str:
+def _record_added_entry(core, key: str, entry: dict) -> None:
+    """Append `entry` onto core.config[key] so the tracked config matches
+    what's actually running. Without this, core.config stays a stale
+    pre-add snapshot: update_xray() would rebuild Xray from it and
+    silently drop every hot-added handler, and a later restart carrying
+    that same stale config back would hit try_hot_reload()'s
+    identical-config no-op path and leave the discrepancy in place."""
+    config = getattr(core, "config", None)
+    if config is None:
+        return
+    config.setdefault(key, []).append(json.loads(json.dumps(entry)))
+
+
+def add_inbound(core, inbound: dict) -> str:
     """Hot-add a single inbound to the running Xray process via `xray api
     adi` against the loopback plaintext API inbound — no restart, so
     existing connections on every other inbound are undisturbed. Raises
     HotReloadError (duplicate tag, Xray unreachable, ...) carrying the
-    CLI's own stderr text as the message."""
-    return _run_xray_api(
+    CLI's own stderr text as the message. On success, records the addition
+    onto core.config (see _record_added_entry)."""
+    output = _run_xray_api(
         ["adi", "stdin:"],
         payload=json.dumps({"inbounds": [inbound]}),
         timeout=XRAY_HOT_ADD_TIMEOUT_SECONDS,
     )
+    _record_added_entry(core, "inbounds", inbound)
+    return output
 
 
-def add_outbound(outbound: dict) -> str:
+def add_outbound(core, outbound: dict) -> str:
     """Same as add_inbound() but for outbounds, via `xray api ado`."""
-    return _run_xray_api(
+    output = _run_xray_api(
         ["ado", "stdin:"],
         payload=json.dumps({"outbounds": [outbound]}),
         timeout=XRAY_HOT_ADD_TIMEOUT_SECONDS,
     )
+    _record_added_entry(core, "outbounds", outbound)
+    return output
 
 
 def _expect_total(stdout: str, expected: int, operation: str) -> None:

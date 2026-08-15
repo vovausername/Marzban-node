@@ -255,7 +255,7 @@ class Service(object):
         # another request is bringing the process down or back up.
         with xray_hot_reload.core_lock:
             try:
-                output = xray_hot_reload.add_inbound(inbound)
+                output = xray_hot_reload.add_inbound(self.core, inbound)
             except xray_hot_reload.HotReloadError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
             return self.response(detail=output.strip())
@@ -269,7 +269,7 @@ class Service(object):
             )
         with xray_hot_reload.core_lock:
             try:
-                output = xray_hot_reload.add_outbound(outbound)
+                output = xray_hot_reload.add_outbound(self.core, outbound)
             except xray_hot_reload.HotReloadError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
             return self.response(detail=output.strip())
