@@ -18,7 +18,7 @@ import xray_hot_reload
 import xray_updater
 from config import (IP_BLOCK_ENABLED, NODE_REMOTE_UPDATE_ENABLED,
                     XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH,
-                    XRAY_REMOTE_UPDATE_ENABLED)
+                    XRAY_HOT_RELOAD_ENABLED, XRAY_REMOTE_UPDATE_ENABLED)
 from logger import logger
 from xray import XRayConfig, XRayCore, wait_until_ready
 
@@ -58,6 +58,8 @@ class Service(object):
         self.router.add_api_route("/stop", self.stop, methods=["POST"])
         self.router.add_api_route("/restart", self.restart, methods=["POST"])
         self.router.add_api_route("/block-ip", self.block_ip, methods=["POST"])
+        self.router.add_api_route("/add-inbound", self.add_inbound, methods=["POST"])
+        self.router.add_api_route("/add-outbound", self.add_outbound, methods=["POST"])
         self.router.add_api_route("/update-xray", self.update_xray, methods=["POST"])
         self.router.add_api_route("/check-for-update", self.check_for_update, methods=["POST"])
         self.router.add_api_route("/update-node", self.update_node, methods=["POST"])
@@ -240,6 +242,41 @@ class Service(object):
             return ip_block.block_ip(ip, minutes)
         except ip_block.IpBlockError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+
+    def add_inbound(self, session_id: UUID = Body(embed=True), inbound: dict = Body(embed=True)):
+        self.match_session_id(session_id)
+        if not XRAY_HOT_RELOAD_ENABLED:
+            raise HTTPException(
+                status_code=403,
+                detail="Xray hot reload is disabled. Set XRAY_HOT_RELOAD_ENABLED=true to allow it.",
+            )
+        # core_lock: `xray api adi` talks to the live process over its
+        # loopback API, which must not be dialed mid-stop/restart while
+        # another request is bringing the process down or back up.
+        with xray_hot_reload.core_lock:
+            if not self.core.started:
+                raise HTTPException(status_code=503, detail="Xray has not been started")
+            try:
+                output = xray_hot_reload.add_inbound(self.core, inbound)
+            except xray_hot_reload.HotReloadError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            return self.response(detail=output.strip())
+
+    def add_outbound(self, session_id: UUID = Body(embed=True), outbound: dict = Body(embed=True)):
+        self.match_session_id(session_id)
+        if not XRAY_HOT_RELOAD_ENABLED:
+            raise HTTPException(
+                status_code=403,
+                detail="Xray hot reload is disabled. Set XRAY_HOT_RELOAD_ENABLED=true to allow it.",
+            )
+        with xray_hot_reload.core_lock:
+            if not self.core.started:
+                raise HTTPException(status_code=503, detail="Xray has not been started")
+            try:
+                output = xray_hot_reload.add_outbound(self.core, outbound)
+            except xray_hot_reload.HotReloadError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            return self.response(detail=output.strip())
 
     def update_xray(self, session_id: UUID = Body(embed=True), version: str = Body(embed=True)):
         self.match_session_id(session_id)
