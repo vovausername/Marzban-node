@@ -12,7 +12,7 @@ import xray_hot_reload
 import xray_updater
 from config import (IP_BLOCK_ENABLED, NODE_REMOTE_UPDATE_ENABLED,
                     XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH,
-                    XRAY_REMOTE_UPDATE_ENABLED)
+                    XRAY_HOT_RELOAD_ENABLED, XRAY_REMOTE_UPDATE_ENABLED)
 from logger import logger
 from xray import XRayConfig, XRayCore, get_xray_version, wait_until_ready
 
@@ -178,6 +178,30 @@ class XrayService(rpyc.Service):
             return ip_block.block_ip(ip, minutes)
         except ip_block.IpBlockError as exc:
             raise ValueError(str(exc))
+
+    @rpyc.exposed
+    def add_inbound(self, inbound: dict) -> str:
+        if not XRAY_HOT_RELOAD_ENABLED:
+            raise PermissionError(
+                "Xray hot reload is disabled. Set XRAY_HOT_RELOAD_ENABLED=true to allow it."
+            )
+        with xray_hot_reload.core_lock:
+            try:
+                return xray_hot_reload.add_inbound(inbound)
+            except xray_hot_reload.HotReloadError as exc:
+                raise ValueError(str(exc))
+
+    @rpyc.exposed
+    def add_outbound(self, outbound: dict) -> str:
+        if not XRAY_HOT_RELOAD_ENABLED:
+            raise PermissionError(
+                "Xray hot reload is disabled. Set XRAY_HOT_RELOAD_ENABLED=true to allow it."
+            )
+        with xray_hot_reload.core_lock:
+            try:
+                return xray_hot_reload.add_outbound(outbound)
+            except xray_hot_reload.HotReloadError as exc:
+                raise ValueError(str(exc))
 
     @rpyc.exposed
     def update_xray(self, version: str) -> dict:

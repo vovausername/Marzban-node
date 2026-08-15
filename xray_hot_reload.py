@@ -19,7 +19,8 @@ import re
 import subprocess
 import threading
 
-from config import XRAY_EXECUTABLE_PATH, XRAY_HOT_RELOAD_ENABLED, XRAY_LOCAL_API_PORT
+from config import (XRAY_EXECUTABLE_PATH, XRAY_HOT_ADD_TIMEOUT_SECONDS,
+                    XRAY_HOT_RELOAD_ENABLED, XRAY_LOCAL_API_PORT)
 from logger import logger
 
 # `adu`/`rmu` print per-user errors but still exit 0; the trailing
@@ -138,24 +139,46 @@ def compute_client_delta(old_config: dict, new_config: dict):
     return {"added": added, "removed": removed}
 
 
-def _run_xray_api(args: list, payload: str = None) -> str:
+def _run_xray_api(args: list, payload: str = None, timeout: int = 3) -> str:
     # Flags must precede positional args (emails / stdin:) — Go's flag
     # parser stops at the first non-flag argument.
     cmd = [
         XRAY_EXECUTABLE_PATH, "api", args[0],
         f"--server=127.0.0.1:{XRAY_LOCAL_API_PORT}",
-        "-timeout", "3",
+        "-timeout", str(timeout),
         *args[1:],
     ]
     try:
         result = subprocess.run(cmd, input=payload, capture_output=True,
-                                text=True, timeout=15)
+                                text=True, timeout=timeout + 12)
     except subprocess.TimeoutExpired:
         raise HotReloadError(f"xray api {args[0]} timed out")
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         raise HotReloadError(f"xray api {args[0]} failed: {detail}")
     return result.stdout
+
+
+def add_inbound(inbound: dict) -> str:
+    """Hot-add a single inbound to the running Xray process via `xray api
+    adi` against the loopback plaintext API inbound — no restart, so
+    existing connections on every other inbound are undisturbed. Raises
+    HotReloadError (duplicate tag, Xray unreachable, ...) carrying the
+    CLI's own stderr text as the message."""
+    return _run_xray_api(
+        ["adi", "stdin:"],
+        payload=json.dumps({"inbounds": [inbound]}),
+        timeout=XRAY_HOT_ADD_TIMEOUT_SECONDS,
+    )
+
+
+def add_outbound(outbound: dict) -> str:
+    """Same as add_inbound() but for outbounds, via `xray api ado`."""
+    return _run_xray_api(
+        ["ado", "stdin:"],
+        payload=json.dumps({"outbounds": [outbound]}),
+        timeout=XRAY_HOT_ADD_TIMEOUT_SECONDS,
+    )
 
 
 def _expect_total(stdout: str, expected: int, operation: str) -> None:
