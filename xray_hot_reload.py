@@ -303,8 +303,36 @@ def update_routing(core, routing: dict) -> str:
     `routing` besides rules/balancers — callers must fall back to a full
     restart if those changed (see routing_hot_changed in the panel).
 
+    Xray-core caveat this guards against: Router.ReloadRules (the AddRule
+    handler) clears r.rules/r.balancers up front when shouldAppend=false,
+    then validates and appends the new ones one at a time; if any rule in
+    the middle fails to build (bad domain/regex/geo file, duplicate
+    ruleTag among the NEW rules, ...), it returns an error with r.rules
+    already trimmed back to empty — not rolled back to the table that was
+    live before this call, including the control-API route this function
+    itself just prepended. Relying solely on the caller to notice the
+    error and restart isn't good enough: nothing here guarantees a caller
+    always follows through (a future caller might not, and even this
+    module's own callers can't act on a table that's already gone empty
+    before their retry/restart reaches the node). So on any failure this
+    function immediately tries to restore the table that was live before
+    the call (core.config["routing"], which is only ever updated on
+    success — see _record_updated_routing) with a second `adrules` call,
+    best-effort. That table was working a moment ago, so it should
+    rebuild cleanly — this is a best-effort narrowing of the empty-table
+    window, not a replacement for the caller's own full-restart fallback,
+    which still triggers off the re-raised error exactly as before either
+    way. Whether the restore itself succeeded is folded into that error's
+    message (not swallowed): "previous routing table restored, service
+    unaffected" vs "restore ALSO failed ... treat as urgent" — the panel
+    only ever learns anything went wrong through this message (it becomes
+    the REST/RPyC error detail, then the panel's log line and its
+    fallback restart's reason string), and those two outcomes are very
+    different severities for whoever reads that trail.
+
     Raises HotReloadError (bad rule, duplicate ruleTag, Xray unreachable,
-    ...) carrying the CLI's own stderr text as the message. On success,
+    ...) carrying the CLI's own stderr text plus the restore outcome
+    above as the message. On success,
     records the new (effective, with the control rule included) routing
     table onto core.config (see _record_updated_routing)."""
     routing = json.loads(json.dumps(routing or {}))
@@ -315,11 +343,41 @@ def update_routing(core, routing: dict) -> str:
     rules[:] = [r for r in rules if r.get("outboundTag") != "API"]
     rules.insert(0, _build_api_routing_rule(core))
 
-    output = _run_xray_api(
-        ["adrules", "stdin:"],
-        payload=json.dumps({"routing": routing}),
-        timeout=XRAY_HOT_ROUTING_TIMEOUT_SECONDS,
-    )
+    config = getattr(core, "config", None)
+    previous_routing = config.get("routing") if config is not None else None
+
+    try:
+        output = _run_xray_api(
+            ["adrules", "stdin:"],
+            payload=json.dumps({"routing": routing}),
+            timeout=XRAY_HOT_ROUTING_TIMEOUT_SECONDS,
+        )
+    except HotReloadError as exc:
+        # The caller (the panel) only learns anything went wrong from this
+        # exception's message — surfaced verbatim as the REST/RPyC error
+        # detail, then logged and put into the fallback restart's reason
+        # string on the panel side. Whether the restore below succeeded is
+        # the difference between "brief blip, already back to normal" and
+        # "Xray has had zero routing rules since this call, treat as
+        # urgent" — both cases fall back to the same full restart either
+        # way, but that distinction matters for whoever is reading the
+        # panel's logs, so it's folded into the message rather than
+        # silently swallowed.
+        if previous_routing is None:
+            raise HotReloadError(f"{exc} (no previous routing table on record to restore)") from exc
+        try:
+            _run_xray_api(
+                ["adrules", "stdin:"],
+                payload=json.dumps({"routing": previous_routing}),
+                timeout=XRAY_HOT_ROUTING_TIMEOUT_SECONDS,
+            )
+        except Exception as restore_exc:
+            raise HotReloadError(
+                f"{exc} (restore of previous routing table ALSO failed: {restore_exc} — "
+                "Xray currently has no routing rules, treat as urgent)"
+            ) from exc
+        raise HotReloadError(f"{exc} (previous routing table restored, service unaffected)") from exc
+
     _record_updated_routing(core, routing)
     return output
 
