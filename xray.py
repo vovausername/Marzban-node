@@ -96,7 +96,8 @@ class XRayConfig(dict):
             "services": [
                 "HandlerService",
                 "StatsService",
-                "LoggerService"
+                "LoggerService",
+                "RoutingService"
             ],
             "tag": "API"
         }
