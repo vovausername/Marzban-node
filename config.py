@@ -29,19 +29,43 @@ XRAY_ASSETS_PATH = config("XRAY_ASSETS_PATH", default="/usr/local/share/xray")
 
 _IMAGE_BAKED_XRAY_EXECUTABLE_PATH = "/usr/local/bin/xray"
 
+# Marks the file at XRAY_EXECUTABLE_PATH as one _seed_persistent_xray_binary()
+# put there itself, as opposed to one explicitly installed by the panel's
+# remote Xray update (xray_updater.apply() deletes this the moment it installs
+# a panel-picked version). While the marker is present, every startup re-seeds
+# from the image-baked binary, so a plain image upgrade still brings whatever
+# newer Xray release it bundles — matching the old (pre-persistence) behavior
+# — right up until an operator actually picks a version through the panel,
+# after which that explicit choice is left alone.
+XRAY_EXECUTABLE_SEEDED_MARKER = XRAY_EXECUTABLE_PATH + ".seeded-from-image"
+
+
+def _install_baked_xray_binary() -> None:
+    # Copy to a temp file in the same directory, then rename into place, so a
+    # copy interrupted partway (e.g. a full volume) can never leave a
+    # truncated binary sitting at XRAY_EXECUTABLE_PATH — os.replace() is
+    # atomic within the same filesystem and only ever swaps in a complete file.
+    os.makedirs(os.path.dirname(XRAY_EXECUTABLE_PATH), exist_ok=True)
+    tmp_path = XRAY_EXECUTABLE_PATH + ".seed-tmp"
+    shutil.copy2(_IMAGE_BAKED_XRAY_EXECUTABLE_PATH, tmp_path)
+    st = os.stat(tmp_path)
+    os.chmod(tmp_path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    os.replace(tmp_path, XRAY_EXECUTABLE_PATH)
+    with open(XRAY_EXECUTABLE_SEEDED_MARKER, "w"):
+        pass
+
 
 def _seed_persistent_xray_binary() -> None:
-    if os.path.isfile(XRAY_EXECUTABLE_PATH):
-        return
     if os.path.abspath(XRAY_EXECUTABLE_PATH) == os.path.abspath(_IMAGE_BAKED_XRAY_EXECUTABLE_PATH):
         return
     if not os.path.isfile(_IMAGE_BAKED_XRAY_EXECUTABLE_PATH):
         return
+    if os.path.isfile(XRAY_EXECUTABLE_PATH) and not os.path.isfile(XRAY_EXECUTABLE_SEEDED_MARKER):
+        # An explicitly installed binary (panel update or manual install)
+        # lives here; never overwrite an operator's choice.
+        return
     try:
-        os.makedirs(os.path.dirname(XRAY_EXECUTABLE_PATH), exist_ok=True)
-        shutil.copy2(_IMAGE_BAKED_XRAY_EXECUTABLE_PATH, XRAY_EXECUTABLE_PATH)
-        st = os.stat(XRAY_EXECUTABLE_PATH)
-        os.chmod(XRAY_EXECUTABLE_PATH, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        _install_baked_xray_binary()
     except OSError as exc:
         print(f"WARNING: could not seed {XRAY_EXECUTABLE_PATH} from {_IMAGE_BAKED_XRAY_EXECUTABLE_PATH}: {exc}")
 
