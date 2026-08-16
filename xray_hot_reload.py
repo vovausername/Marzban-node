@@ -303,6 +303,20 @@ def update_routing(core, routing: dict) -> str:
     `routing` besides rules/balancers — callers must fall back to a full
     restart if those changed (see routing_hot_changed in the panel).
 
+    Known Xray-core caveat, not fixable from this side: Router.ReloadRules
+    (the AddRule handler) clears r.rules/r.balancers up front when
+    shouldAppend=false, then validates and appends the new ones one at a
+    time; if any rule in the middle fails to build (bad domain/regex/geo
+    file, duplicate ruleTag among the NEW rules, ...), it returns an error
+    with r.rules already trimmed back to empty — not rolled back to the
+    table that was live before this call. The Xray process keeps running
+    with NO routing rules for the (typically sub-second) window between
+    that failure and the caller's fallback restart completing. There is no
+    server-side "validate first, apply atomically" alternative to fall
+    back to; the best mitigation is what callers already do — treat any
+    error here as fatal and restart immediately, keeping that window as
+    short as possible rather than retrying or queuing.
+
     Raises HotReloadError (bad rule, duplicate ruleTag, Xray unreachable,
     ...) carrying the CLI's own stderr text as the message. On success,
     records the new (effective, with the control rule included) routing
