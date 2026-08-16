@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 import zipfile
 
-from config import XRAY_EXECUTABLE_PATH
+from config import XRAY_EXECUTABLE_PATH, XRAY_EXECUTABLE_SEEDED_MARKER
 from logger import logger
 from xray import wait_until_ready
 
@@ -269,6 +269,15 @@ def apply(prepared: PreparedUpdate, core) -> dict:
 
     if os.path.exists(backup_path):
         os.remove(backup_path)
+
+    # This binary was just explicitly installed through the panel — stop
+    # config.py's startup seeding from treating it as a placeholder it's
+    # free to overwrite on the next image upgrade.
+    if os.path.exists(XRAY_EXECUTABLE_SEEDED_MARKER):
+        try:
+            os.remove(XRAY_EXECUTABLE_SEEDED_MARKER)
+        except OSError:
+            pass
 
     logger.warning(f"Xray updated: {previous_version} -> {core.version}")
     return {"previous_version": previous_version, "new_version": core.version}
