@@ -21,7 +21,7 @@ import threading
 
 from config import (INBOUNDS, XRAY_EXECUTABLE_PATH,
                     XRAY_HOT_ADD_TIMEOUT_SECONDS, XRAY_HOT_RELOAD_ENABLED,
-                    XRAY_LOCAL_API_PORT)
+                    XRAY_HOT_ROUTING_TIMEOUT_SECONDS, XRAY_LOCAL_API_PORT)
 from logger import logger
 
 # `adu`/`rmu` print per-user errors but still exit 0; the trailing
@@ -252,6 +252,91 @@ def remove_outbound(core, tag: str) -> str:
     output = _run_xray_api(["rmo", tag], timeout=XRAY_HOT_ADD_TIMEOUT_SECONDS)
     _record_removed_entry(core, "outbounds", tag)
     return output
+
+
+def _build_api_routing_rule(core) -> dict:
+    """Rebuild the routing rule XRayConfig._apply_api() injects for
+    API_INBOUND/API_INBOUND_LOCAL on every /start and /restart (see
+    xray.py) — the caller's `routing` payload never has it, since the
+    panel has no knowledge these node-local control inbounds exist at
+    all. update_routing() must prepend this before replacing the table,
+    or the node permanently loses the ability to reach its own control
+    API — including every future hot-reload call (add/remove
+    inbound/outbound, user adu/rmu, and update_routing itself) — the
+    moment the first whole-table replace goes out without it."""
+    api_inbound_tags = ["API_INBOUND"]
+    if XRAY_HOT_RELOAD_ENABLED:
+        api_inbound_tags.append("API_INBOUND_LOCAL")
+    peer_ip = getattr(core.config, "peer_ip", None) if getattr(core, "config", None) is not None else None
+    source = ["127.0.0.1", peer_ip] if peer_ip else ["127.0.0.1"]
+    return {
+        "inboundTag": api_inbound_tags,
+        "source": source,
+        "outboundTag": "API",
+        "type": "field",
+    }
+
+
+def update_routing(core, routing: dict) -> str:
+    """Hot-replace the entire routing table (rules + balancers) on the
+    running Xray process via `xray api adrules` (without `-append`) — no
+    restart, existing connections on every inbound/outbound are undisturbed.
+
+    Unlike add_inbound/remove_inbound (which target one tagged entry),
+    Xray's RoutingService has no per-rule "alter" or targeted "add one rule
+    among many" primitive that preserves rule order: AddRule with
+    shouldAppend=false atomically clears and rebuilds the whole rule (and
+    balancer) list from what's sent, which is also the only way to
+    guarantee the new rule order matches exactly what the caller intends
+    (routing rules are evaluated in order — appending would put changed
+    rules last, silently altering which rule wins for ambiguous traffic).
+    `-append` is intentionally never used here for that reason.
+
+    Always prepends the node's own control-API routing rule (see
+    _build_api_routing_rule) regardless of what the caller sent — the
+    panel has no idea API_INBOUND/API_INBOUND_LOCAL exist, so its payload
+    never includes it, and a whole-table replace without it would strand
+    the node with no route from its control inbounds to the "API"
+    outbound.
+
+    Does NOT touch domainStrategy/domainMatcher or anything else in
+    `routing` besides rules/balancers — callers must fall back to a full
+    restart if those changed (see routing_hot_changed in the panel).
+
+    Raises HotReloadError (bad rule, duplicate ruleTag, Xray unreachable,
+    ...) carrying the CLI's own stderr text as the message. On success,
+    records the new (effective, with the control rule included) routing
+    table onto core.config (see _record_updated_routing)."""
+    routing = json.loads(json.dumps(routing or {}))
+    rules = routing.setdefault("rules", [])
+    # Drop any stale/caller-sent rule already targeting the API outbound
+    # before prepending the freshly rebuilt one, so there is never more
+    # than one control rule in the effective table.
+    rules[:] = [r for r in rules if r.get("outboundTag") != "API"]
+    rules.insert(0, _build_api_routing_rule(core))
+
+    output = _run_xray_api(
+        ["adrules", "stdin:"],
+        payload=json.dumps({"routing": routing}),
+        timeout=XRAY_HOT_ROUTING_TIMEOUT_SECONDS,
+    )
+    _record_updated_routing(core, routing)
+    return output
+
+
+def _record_updated_routing(core, routing: dict) -> None:
+    """Replace core.config["routing"] with `routing` — the routing
+    equivalent of _record_added_entry/_record_removed_entry. Without this,
+    core.config would keep claiming the old routing table is running after
+    it's actually been replaced: update_xray() would rebuild Xray from the
+    stale table on the next binary swap, and a later restart carrying the
+    panel's config (which already has the new table) would see a spurious
+    structural diff against try_hot_reload()'s stripped-clients comparison
+    instead of matching."""
+    config = getattr(core, "config", None)
+    if config is None:
+        return
+    config["routing"] = json.loads(json.dumps(routing))
 
 
 def _expect_total(stdout: str, expected: int, operation: str) -> None:

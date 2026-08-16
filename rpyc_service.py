@@ -236,6 +236,20 @@ class XrayService(rpyc.Service):
                 raise ValueError(str(exc))
 
     @rpyc.exposed
+    def update_routing(self, routing: dict) -> str:
+        if not XRAY_HOT_RELOAD_ENABLED:
+            raise PermissionError(
+                "Xray hot reload is disabled. Set XRAY_HOT_RELOAD_ENABLED=true to allow it."
+            )
+        if self.core is None:
+            raise ProcessLookupError("Xray has not been started")
+        with xray_hot_reload.core_lock:
+            try:
+                return xray_hot_reload.update_routing(self.core, routing)
+            except xray_hot_reload.HotReloadError as exc:
+                raise ValueError(str(exc))
+
+    @rpyc.exposed
     def update_xray(self, version: str) -> dict:
         if not XRAY_REMOTE_UPDATE_ENABLED:
             raise PermissionError(
