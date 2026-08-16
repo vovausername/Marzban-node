@@ -303,19 +303,27 @@ def update_routing(core, routing: dict) -> str:
     `routing` besides rules/balancers — callers must fall back to a full
     restart if those changed (see routing_hot_changed in the panel).
 
-    Known Xray-core caveat, not fixable from this side: Router.ReloadRules
-    (the AddRule handler) clears r.rules/r.balancers up front when
-    shouldAppend=false, then validates and appends the new ones one at a
-    time; if any rule in the middle fails to build (bad domain/regex/geo
-    file, duplicate ruleTag among the NEW rules, ...), it returns an error
-    with r.rules already trimmed back to empty — not rolled back to the
-    table that was live before this call. The Xray process keeps running
-    with NO routing rules for the (typically sub-second) window between
-    that failure and the caller's fallback restart completing. There is no
-    server-side "validate first, apply atomically" alternative to fall
-    back to; the best mitigation is what callers already do — treat any
-    error here as fatal and restart immediately, keeping that window as
-    short as possible rather than retrying or queuing.
+    Xray-core caveat this guards against: Router.ReloadRules (the AddRule
+    handler) clears r.rules/r.balancers up front when shouldAppend=false,
+    then validates and appends the new ones one at a time; if any rule in
+    the middle fails to build (bad domain/regex/geo file, duplicate
+    ruleTag among the NEW rules, ...), it returns an error with r.rules
+    already trimmed back to empty — not rolled back to the table that was
+    live before this call, including the control-API route this function
+    itself just prepended. Relying solely on the caller to notice the
+    error and restart isn't good enough: nothing here guarantees a caller
+    always follows through (a future caller might not, and even this
+    module's own callers can't act on a table that's already gone empty
+    before their retry/restart reaches the node). So on any failure this
+    function immediately tries to restore the table that was live before
+    the call (core.config["routing"], which is only ever updated on
+    success — see _record_updated_routing) with a second `adrules` call,
+    best-effort. That table was working a moment ago, so it should
+    rebuild cleanly; if the restore attempt also fails (Xray genuinely
+    unreachable, ...) it's swallowed and the ORIGINAL error is still
+    raised, so callers still see the real failure and can fall back to a
+    full restart same as before — this is a best-effort narrowing of the
+    empty-table window, not a replacement for that fallback.
 
     Raises HotReloadError (bad rule, duplicate ruleTag, Xray unreachable,
     ...) carrying the CLI's own stderr text as the message. On success,
@@ -329,11 +337,27 @@ def update_routing(core, routing: dict) -> str:
     rules[:] = [r for r in rules if r.get("outboundTag") != "API"]
     rules.insert(0, _build_api_routing_rule(core))
 
-    output = _run_xray_api(
-        ["adrules", "stdin:"],
-        payload=json.dumps({"routing": routing}),
-        timeout=XRAY_HOT_ROUTING_TIMEOUT_SECONDS,
-    )
+    config = getattr(core, "config", None)
+    previous_routing = config.get("routing") if config is not None else None
+
+    try:
+        output = _run_xray_api(
+            ["adrules", "stdin:"],
+            payload=json.dumps({"routing": routing}),
+            timeout=XRAY_HOT_ROUTING_TIMEOUT_SECONDS,
+        )
+    except HotReloadError:
+        if previous_routing is not None:
+            try:
+                _run_xray_api(
+                    ["adrules", "stdin:"],
+                    payload=json.dumps({"routing": previous_routing}),
+                    timeout=XRAY_HOT_ROUTING_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                pass  # best-effort — the caller's own restart is still the real backstop
+        raise
+
     _record_updated_routing(core, routing)
     return output
 
