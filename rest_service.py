@@ -62,6 +62,7 @@ class Service(object):
         self.router.add_api_route("/add-outbound", self.add_outbound, methods=["POST"])
         self.router.add_api_route("/remove-inbound", self.remove_inbound, methods=["POST"])
         self.router.add_api_route("/remove-outbound", self.remove_outbound, methods=["POST"])
+        self.router.add_api_route("/update-routing", self.update_routing, methods=["POST"])
         self.router.add_api_route("/update-xray", self.update_xray, methods=["POST"])
         self.router.add_api_route("/check-for-update", self.check_for_update, methods=["POST"])
         self.router.add_api_route("/update-node", self.update_node, methods=["POST"])
@@ -308,6 +309,25 @@ class Service(object):
                 raise HTTPException(status_code=503, detail="Xray has not been started")
             try:
                 output = xray_hot_reload.remove_outbound(self.core, tag)
+            except xray_hot_reload.HotReloadError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            return self.response(detail=output.strip())
+
+    def update_routing(self, session_id: UUID = Body(embed=True), routing: dict = Body(embed=True)):
+        self.match_session_id(session_id)
+        if not XRAY_HOT_RELOAD_ENABLED:
+            raise HTTPException(
+                status_code=403,
+                detail="Xray hot reload is disabled. Set XRAY_HOT_RELOAD_ENABLED=true to allow it.",
+            )
+        # core_lock: `xray api adrules` talks to the live process over its
+        # loopback API, which must not be dialed mid-stop/restart while
+        # another request is bringing the process down or back up.
+        with xray_hot_reload.core_lock:
+            if not self.core.started:
+                raise HTTPException(status_code=503, detail="Xray has not been started")
+            try:
+                output = xray_hot_reload.update_routing(self.core, routing)
             except xray_hot_reload.HotReloadError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
             return self.response(detail=output.strip())

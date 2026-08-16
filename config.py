@@ -67,6 +67,16 @@ XRAY_LOCAL_API_PORT = config("XRAY_LOCAL_API_PORT", cast=int, default=62052)
 # on the same loopback plaintext API inbound.
 XRAY_HOT_ADD_TIMEOUT_SECONDS = config("XRAY_HOT_ADD_TIMEOUT_SECONDS", cast=int, default=10)
 
+# Timeout (seconds) for `xray api adrules` — hot-replacing the entire routing
+# table (rules + balancers) on the running Xray process without a restart,
+# exposed via rest_service's /update-routing (and rpyc_service's equivalent).
+# Higher than adi/ado's default since building routing rules can involve
+# loading GeoIP/GeoSite databases and compiling domain matchers, which is
+# slower than building a single inbound/outbound handler. Reuses
+# XRAY_HOT_RELOAD_ENABLED as its on/off switch since it depends on the same
+# loopback plaintext API inbound.
+XRAY_HOT_ROUTING_TIMEOUT_SECONDS = config("XRAY_HOT_ROUTING_TIMEOUT_SECONDS", cast=int, default=20)
+
 # How long to watch a freshly (re)started Xray process before trusting that
 # it actually stayed up, and how often to poll it while watching. Used by
 # xray.wait_until_ready() — the single place both service handlers and
