@@ -8,7 +8,7 @@ from fastapi import (APIRouter, Body, FastAPI, HTTPException, Request,
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 import ip_block
 import node_updater
@@ -434,7 +434,9 @@ class Service(object):
 
                 if not logs:
                     try:
-                        await asyncio.wait_for(websocket.receive(), timeout=0.2)
+                        message = await asyncio.wait_for(websocket.receive(), timeout=0.2)
+                        if message.get("type") == "websocket.disconnect":
+                            break
                         continue
                     except asyncio.TimeoutError:
                         continue
@@ -452,7 +454,12 @@ class Service(object):
                 except (WebSocketDisconnect, RuntimeError):
                     break
 
-        await websocket.close()
+        if websocket.client_state != WebSocketState.DISCONNECTED and \
+                websocket.application_state != WebSocketState.DISCONNECTED:
+            try:
+                await websocket.close()
+            except RuntimeError:
+                pass
 
 
 service = Service()
