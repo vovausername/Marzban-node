@@ -1,3 +1,7 @@
+import os
+import shutil
+import stat
+
 from decouple import config
 from dotenv import load_dotenv
 
@@ -8,8 +12,41 @@ SERVICE_PORT = config('SERVICE_PORT', cast=int, default=62050)
 
 XRAY_API_HOST = config("XRAY_API_HOST", default="0.0.0.0")
 XRAY_API_PORT = config('XRAY_API_PORT', cast=int, default=62051)
-XRAY_EXECUTABLE_PATH = config("XRAY_EXECUTABLE_PATH", default="/usr/local/bin/xray")
+
+# Defaults to a path under the bind-mounted /var/lib/marzban-node volume
+# (see docker-compose.yml), not the image's own /usr/local/bin/xray, so a
+# version installed through the panel's remote Xray update (xray_updater.py,
+# which replaces whatever binary sits at this path) survives container
+# recreation. Without this, a panel-triggered node self-update
+# (node_updater.py's `docker compose pull && up -d --force-recreate`)
+# starts a brand-new container whose /usr/local/bin/xray is whatever was
+# baked into the image at build time, silently reverting any Xray version
+# picked through the panel. _seed_persistent_xray_binary() below populates
+# this path from the image-baked binary the first time it's empty (fresh
+# volume), so this works out of the box with no manual step required.
+XRAY_EXECUTABLE_PATH = config("XRAY_EXECUTABLE_PATH", default="/var/lib/marzban-node/xray-core/xray")
 XRAY_ASSETS_PATH = config("XRAY_ASSETS_PATH", default="/usr/local/share/xray")
+
+_IMAGE_BAKED_XRAY_EXECUTABLE_PATH = "/usr/local/bin/xray"
+
+
+def _seed_persistent_xray_binary() -> None:
+    if os.path.isfile(XRAY_EXECUTABLE_PATH):
+        return
+    if os.path.abspath(XRAY_EXECUTABLE_PATH) == os.path.abspath(_IMAGE_BAKED_XRAY_EXECUTABLE_PATH):
+        return
+    if not os.path.isfile(_IMAGE_BAKED_XRAY_EXECUTABLE_PATH):
+        return
+    try:
+        os.makedirs(os.path.dirname(XRAY_EXECUTABLE_PATH), exist_ok=True)
+        shutil.copy2(_IMAGE_BAKED_XRAY_EXECUTABLE_PATH, XRAY_EXECUTABLE_PATH)
+        st = os.stat(XRAY_EXECUTABLE_PATH)
+        os.chmod(XRAY_EXECUTABLE_PATH, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    except OSError as exc:
+        print(f"WARNING: could not seed {XRAY_EXECUTABLE_PATH} from {_IMAGE_BAKED_XRAY_EXECUTABLE_PATH}: {exc}")
+
+
+_seed_persistent_xray_binary()
 
 SSL_CERT_FILE = config("SSL_CERT_FILE", default="/var/lib/marzban-node/ssl_cert.pem")
 SSL_KEY_FILE = config("SSL_KEY_FILE", default="/var/lib/marzban-node/ssl_key.pem")
