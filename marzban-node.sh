@@ -50,12 +50,11 @@ fi
 # custom install name when this file is invoked by its installed path/name
 # (e.g. running the installed `marzban-node2` command after `install
 # --name marzban-node2`). Piped one-liners like
-# `bash -c "$(curl ...)" @ migrate` set $0 to the literal placeholder
-# ("@"), which isn't an install name at all — falling back to it here
-# broke every piped management command except install/install-script
-# (they get APP_NAME above regardless). Only trust the basename guess when
-# a matching /opt install directory actually exists for it; otherwise use
-# the default name.
+# `curl ... | bash -s -- migrate` leave $0 as the literal "bash", which
+# isn't an install name at all — falling back to it here broke every piped
+# management command except install/install-script (they get APP_NAME above
+# regardless). Only trust the basename guess when a matching /opt install
+# directory actually exists for it; otherwise use the default name.
 if [ -z "$APP_NAME" ]; then
     SCRIPT_NAME=$(basename "$0")
     GUESSED_APP_NAME="${SCRIPT_NAME%.*}"

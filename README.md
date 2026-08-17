@@ -5,16 +5,22 @@ This is [vovausername/Marzban-node](https://github.com/vovausername/Marzban-node
 ## Quick install
 Install Marzban-node on your server using this command
 ```bash
-sudo bash -c "$(curl -sL https://github.com/vovausername/Marzban-node/raw/master/marzban-node.sh)" @ install
+curl -sL https://github.com/vovausername/Marzban-node/raw/master/marzban-node.sh | sudo bash -s -- install
 ```
 Install Marzban-node on your server using this command with custom name:
 ```bash
-sudo bash -c "$(curl -sL https://github.com/vovausername/Marzban-node/raw/master/marzban-node.sh)" @ install --name marzban-node2
+curl -sL https://github.com/vovausername/Marzban-node/raw/master/marzban-node.sh | sudo bash -s -- install --name marzban-node2
 ```
 Or you can only install this script (marzban-node command) on your server by using this command
 ```bash
-sudo bash -c "$(curl -sL https://github.com/vovausername/Marzban-node/raw/master/marzban-node.sh)" @ install-script
+curl -sL https://github.com/vovausername/Marzban-node/raw/master/marzban-node.sh | sudo bash -s -- install-script
 ```
+
+Piping straight into `bash -s --` (instead of substituting the whole
+downloaded script into a `bash -c "$(...)"` argument) avoids `Argument list
+too long` failures that `$(...)` substitution can hit on shells/hosts with a
+small `ARG_MAX` or a large existing environment. `sudo` wraps `bash`, not
+`curl`, so the download itself doesn't need root.
 
 During install, you'll be asked (in addition to the usual protocol/cert/port
 prompts) whether to enable this fork's remote-control triggers: remote
@@ -36,7 +42,7 @@ If you already have a node installed from the original
 `Gozargah/Marzban-scripts` installer (pointing at `gozargah/marzban-node`),
 switch it to this fork in place with:
 ```bash
-sudo bash -c "$(curl -sL https://github.com/vovausername/Marzban-node/raw/master/marzban-node.sh)" @ migrate
+curl -sL https://github.com/vovausername/Marzban-node/raw/master/marzban-node.sh | sudo bash -s -- migrate
 ```
 This rewrites the node's existing `docker-compose.yml` to use this fork's
 image, asks whether to turn on the remote-control triggers (adding
@@ -74,7 +80,7 @@ Existing nodes need one last manual update to pick this feature up (their
 installed CLI predates it, so run the one-liner, which always executes the
 latest script):
 ```bash
-sudo bash -c "$(curl -sL https://github.com/vovausername/Marzban-node/raw/master/marzban-node.sh)" @ update
+curl -sL https://github.com/vovausername/Marzban-node/raw/master/marzban-node.sh | sudo bash -s -- update
 ```
 That single command updates the node **and** installs the watcher. From
 then on, every update — of the node and of the watcher itself — can be
