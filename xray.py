@@ -294,9 +294,51 @@ class XRayCore:
         try:
             logger.warning("Restarting Xray core...")
             self.stop()
-            self.start(config)
+            self._start_with_bind_retry(config)
         finally:
             self.restarting = False
+
+    # Delays (seconds) between successive bind-conflict retries in
+    # _start_with_bind_retry — 3 attempts total (2 retries).
+    _BIND_RETRY_DELAYS = (0.5, 1.0)
+    _BIND_RETRY_PROBE_SECONDS = 0.5
+    _BIND_RETRY_PROBE_INTERVAL = 0.05
+
+    def _start_with_bind_retry(self, config: XRayConfig) -> None:
+        """start(), retrying a couple of times if the freshly-spawned
+        process dies almost immediately with "address already in use".
+
+        The OS can take a brief moment to fully release a listening socket
+        right after the previous Xray process exits (observed in practice
+        on XHTTP/H2 inbounds) — a restart landing in that narrow window
+        would otherwise fail outright even though the very same port binds
+        cleanly a moment later. Only retries a fast, bind-conflict-shaped
+        failure caught within a short probe window; anything else (a
+        different startup error, or a process that's still running past
+        the probe window) is left exactly as before for the caller's own
+        wait_until_ready()/get_logs() to report.
+        """
+        delays = (0.0, *self._BIND_RETRY_DELAYS)
+        for attempt, delay in enumerate(delays, start=1):
+            if delay:
+                time.sleep(delay)
+
+            self.start(config)
+
+            if wait_until_ready(self, timeout=self._BIND_RETRY_PROBE_SECONDS,
+                                 poll_interval=self._BIND_RETRY_PROBE_INTERVAL):
+                return  # survived the probe window — hand off to the caller as usual
+
+            with self.get_logs() as logs:
+                last_log = logs[-1] if logs else ''
+            self.process = None
+
+            if attempt == len(delays) or "address already in use" not in last_log.lower():
+                return  # give up, or not our failure mode — caller reports it as before
+
+            logger.warning(
+                f"Xray failed to bind (attempt {attempt}/{len(delays)}), retrying: {last_log}"
+            )
 
     def on_start(self, func: callable):
         self._on_start_funcs.append(func)

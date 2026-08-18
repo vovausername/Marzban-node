@@ -21,13 +21,18 @@ import threading
 
 from config import (INBOUNDS, XRAY_EXECUTABLE_PATH,
                     XRAY_HOT_ADD_TIMEOUT_SECONDS, XRAY_HOT_RELOAD_ENABLED,
-                    XRAY_HOT_ROUTING_TIMEOUT_SECONDS, XRAY_LOCAL_API_PORT)
+                    XRAY_LOCAL_API_PORT)
 from logger import logger
 
 # `adu`/`rmu` print per-user errors but still exit 0; the trailing
 # "Added/Removed N user(s) in total." line is the only reliable success
 # signal, so it is parsed and compared against the expected count.
 _TOTAL_RE = re.compile(r"(?:Added|Removed) (\d+) user\(s\) in total\.")
+
+# `rmu`'s per-user error for a user the live process doesn't have — see
+# _expect_removed for why this is treated as success rather than a hard
+# failure.
+_NOT_FOUND_RE = re.compile(r"User (\S+) not found", re.IGNORECASE)
 
 # One synchronization boundary around every mutation of the live core:
 # connect/disconnect/start/stop/restart, hot-reload's diff against
@@ -254,149 +259,6 @@ def remove_outbound(core, tag: str) -> str:
     return output
 
 
-def _build_api_routing_rule(core) -> dict:
-    """Rebuild the routing rule XRayConfig._apply_api() injects for
-    API_INBOUND/API_INBOUND_LOCAL on every /start and /restart (see
-    xray.py) — the caller's `routing` payload never has it, since the
-    panel has no knowledge these node-local control inbounds exist at
-    all. update_routing() must prepend this before replacing the table,
-    or the node permanently loses the ability to reach its own control
-    API — including every future hot-reload call (add/remove
-    inbound/outbound, user adu/rmu, and update_routing itself) — the
-    moment the first whole-table replace goes out without it."""
-    api_inbound_tags = ["API_INBOUND"]
-    if XRAY_HOT_RELOAD_ENABLED:
-        api_inbound_tags.append("API_INBOUND_LOCAL")
-    peer_ip = getattr(core.config, "peer_ip", None) if getattr(core, "config", None) is not None else None
-    source = ["127.0.0.1", peer_ip] if peer_ip else ["127.0.0.1"]
-    return {
-        "inboundTag": api_inbound_tags,
-        "source": source,
-        "outboundTag": "API",
-        "type": "field",
-    }
-
-
-def update_routing(core, routing: dict) -> str:
-    """Hot-replace the entire routing table (rules + balancers) on the
-    running Xray process via `xray api adrules` (without `-append`) — no
-    restart, existing connections on every inbound/outbound are undisturbed.
-
-    Unlike add_inbound/remove_inbound (which target one tagged entry),
-    Xray's RoutingService has no per-rule "alter" or targeted "add one rule
-    among many" primitive that preserves rule order: AddRule with
-    shouldAppend=false atomically clears and rebuilds the whole rule (and
-    balancer) list from what's sent, which is also the only way to
-    guarantee the new rule order matches exactly what the caller intends
-    (routing rules are evaluated in order — appending would put changed
-    rules last, silently altering which rule wins for ambiguous traffic).
-    `-append` is intentionally never used here for that reason.
-
-    Always prepends the node's own control-API routing rule (see
-    _build_api_routing_rule) regardless of what the caller sent — the
-    panel has no idea API_INBOUND/API_INBOUND_LOCAL exist, so its payload
-    never includes it, and a whole-table replace without it would strand
-    the node with no route from its control inbounds to the "API"
-    outbound.
-
-    Does NOT touch domainStrategy/domainMatcher or anything else in
-    `routing` besides rules/balancers — callers must fall back to a full
-    restart if those changed (see routing_hot_changed in the panel).
-
-    Xray-core caveat this guards against: Router.ReloadRules (the AddRule
-    handler) clears r.rules/r.balancers up front when shouldAppend=false,
-    then validates and appends the new ones one at a time; if any rule in
-    the middle fails to build (bad domain/regex/geo file, duplicate
-    ruleTag among the NEW rules, ...), it returns an error with r.rules
-    already trimmed back to empty — not rolled back to the table that was
-    live before this call, including the control-API route this function
-    itself just prepended. Relying solely on the caller to notice the
-    error and restart isn't good enough: nothing here guarantees a caller
-    always follows through (a future caller might not, and even this
-    module's own callers can't act on a table that's already gone empty
-    before their retry/restart reaches the node). So on any failure this
-    function immediately tries to restore the table that was live before
-    the call (core.config["routing"], which is only ever updated on
-    success — see _record_updated_routing) with a second `adrules` call,
-    best-effort. That table was working a moment ago, so it should
-    rebuild cleanly — this is a best-effort narrowing of the empty-table
-    window, not a replacement for the caller's own full-restart fallback,
-    which still triggers off the re-raised error exactly as before either
-    way. Whether the restore itself succeeded is folded into that error's
-    message (not swallowed): "previous routing table restored, service
-    unaffected" vs "restore ALSO failed ... treat as urgent" — the panel
-    only ever learns anything went wrong through this message (it becomes
-    the REST/RPyC error detail, then the panel's log line and its
-    fallback restart's reason string), and those two outcomes are very
-    different severities for whoever reads that trail.
-
-    Raises HotReloadError (bad rule, duplicate ruleTag, Xray unreachable,
-    ...) carrying the CLI's own stderr text plus the restore outcome
-    above as the message. On success,
-    records the new (effective, with the control rule included) routing
-    table onto core.config (see _record_updated_routing)."""
-    routing = json.loads(json.dumps(routing or {}))
-    rules = routing.setdefault("rules", [])
-    # Drop any stale/caller-sent rule already targeting the API outbound
-    # before prepending the freshly rebuilt one, so there is never more
-    # than one control rule in the effective table.
-    rules[:] = [r for r in rules if r.get("outboundTag") != "API"]
-    rules.insert(0, _build_api_routing_rule(core))
-
-    config = getattr(core, "config", None)
-    previous_routing = config.get("routing") if config is not None else None
-
-    try:
-        output = _run_xray_api(
-            ["adrules", "stdin:"],
-            payload=json.dumps({"routing": routing}),
-            timeout=XRAY_HOT_ROUTING_TIMEOUT_SECONDS,
-        )
-    except HotReloadError as exc:
-        # The caller (the panel) only learns anything went wrong from this
-        # exception's message — surfaced verbatim as the REST/RPyC error
-        # detail, then logged and put into the fallback restart's reason
-        # string on the panel side. Whether the restore below succeeded is
-        # the difference between "brief blip, already back to normal" and
-        # "Xray has had zero routing rules since this call, treat as
-        # urgent" — both cases fall back to the same full restart either
-        # way, but that distinction matters for whoever is reading the
-        # panel's logs, so it's folded into the message rather than
-        # silently swallowed.
-        if previous_routing is None:
-            raise HotReloadError(f"{exc} (no previous routing table on record to restore)") from exc
-        try:
-            _run_xray_api(
-                ["adrules", "stdin:"],
-                payload=json.dumps({"routing": previous_routing}),
-                timeout=XRAY_HOT_ROUTING_TIMEOUT_SECONDS,
-            )
-        except Exception as restore_exc:
-            raise HotReloadError(
-                f"{exc} (restore of previous routing table ALSO failed: {restore_exc} — "
-                "Xray currently has no routing rules, treat as urgent)"
-            ) from exc
-        raise HotReloadError(f"{exc} (previous routing table restored, service unaffected)") from exc
-
-    _record_updated_routing(core, routing)
-    return output
-
-
-def _record_updated_routing(core, routing: dict) -> None:
-    """Replace core.config["routing"] with `routing` — the routing
-    equivalent of _record_added_entry/_record_removed_entry. Without this,
-    core.config would keep claiming the old routing table is running after
-    it's actually been replaced: update_xray() would rebuild Xray from the
-    stale table on the next binary swap, and a later restart carrying the
-    panel's config (which already has the new table) would see a spurious
-    structural diff against try_hot_reload()'s stripped-clients comparison
-    instead of matching."""
-    config = getattr(core, "config", None)
-    if config is None:
-        return
-    config["routing"] = json.loads(json.dumps(routing))
-
-
 def _expect_total(stdout: str, expected: int, operation: str) -> None:
     m = _TOTAL_RE.search(stdout)
     if not m or int(m.group(1)) != expected:
@@ -406,12 +268,64 @@ def _expect_total(stdout: str, expected: int, operation: str) -> None:
         )
 
 
-def apply_delta(new_config: dict, delta: dict) -> None:
+def _expect_removed(stdout: str, emails: list, tag: str) -> None:
+    """rmu prints per-user errors but exits 0; a user reported "not found"
+    is treated as success rather than a hard failure — the desired end
+    state (user gone from this inbound) is already true. This happens
+    routinely when an earlier hot-reload attempt removed the same users
+    live but then failed on a *later* tag before core.config could be
+    updated to match (see the progressive core.config sync in
+    apply_delta): the next attempt recomputes the identical "remove these"
+    delta against a live process that's already caught up. Any other
+    failure (Xray unreachable, malformed email, ...) still raises."""
+    m = _TOTAL_RE.search(stdout)
+    removed_count = int(m.group(1)) if m else 0
+    not_found = set(_NOT_FOUND_RE.findall(stdout)) & set(emails)
+    if removed_count + len(not_found) < len(emails):
+        raise HotReloadError(
+            f"xray api rmu applied {removed_count} of {len(emails)} user(s) "
+            f"on inbound {tag!r}: {stdout.strip()}"
+        )
+
+
+def _record_user_delta(core, tag: str, removed_emails=None, added_clients=None) -> None:
+    """Update core.config's inbound `tag` client list to reflect a
+    successful adu/rmu call — the per-user equivalent of
+    _record_added_entry/_record_removed_entry, applied incrementally as
+    apply_delta works through each tag rather than only once at the very
+    end. Without this, a later tag's rmu/adu failing mid apply_delta would
+    leave core.config believing this tag's already-successful change never
+    happened: the next hot-reload attempt would recompute the exact same
+    delta for this tag and hit spurious "already removed"/"already exists"
+    responses against the live process instead of a no-op."""
+    config = getattr(core, "config", None)
+    if config is None:
+        return
+    for inbound in config.get("inbounds", []):
+        if inbound.get("tag") != tag:
+            continue
+        settings = inbound.get("settings")
+        if not isinstance(settings, dict):
+            return
+        clients = settings.get("clients")
+        if not isinstance(clients, list):
+            return
+        if removed_emails:
+            clients[:] = [c for c in clients if c.get("email") not in removed_emails]
+        if added_clients:
+            clients.extend(json.loads(json.dumps(added_clients)))
+        return
+
+
+def apply_delta(core, new_config: dict, delta: dict) -> None:
     # Removals first: a changed user's old credentials must be gone before
     # `adu` re-adds them — it errors on a duplicate email.
     for tag, emails in delta["removed"].items():
         output = _run_xray_api(["rmu", f"-tag={tag}", *emails])
-        _expect_total(output, len(emails), "rmu")
+        _expect_removed(output, emails, tag)
+        # The full requested set is confirmed gone either way (freshly
+        # removed or already absent) — see _expect_removed.
+        _record_user_delta(core, tag, removed_emails=set(emails))
 
     if not delta["added"]:
         return
@@ -433,6 +347,8 @@ def apply_delta(new_config: dict, delta: dict) -> None:
     output = _run_xray_api(["adu", "stdin:"],
                            payload=json.dumps({"inbounds": payload_inbounds}))
     _expect_total(output, total_added, "adu")
+    for inbound in payload_inbounds:
+        _record_user_delta(core, inbound["tag"], added_clients=inbound["settings"]["clients"])
 
 
 def try_hot_reload(core, new_config: dict) -> bool:
@@ -475,7 +391,7 @@ def try_hot_reload(core, new_config: dict) -> bool:
             return False
 
         try:
-            apply_delta(new_config, delta)
+            apply_delta(core, new_config, delta)
         except Exception as exc:
             logger.warning(f"Hot reload failed ({exc}), falling back to full restart")
             return False
