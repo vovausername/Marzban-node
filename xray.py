@@ -168,6 +168,7 @@ class XRayCore:
 
         self.version = self.get_version()
         self.process = None
+        self._log_thread = None
         self.restarting = False
 
         self._logs_buffer = deque(maxlen=100)
@@ -209,10 +210,9 @@ class XRayCore:
                 elif not self.process or self.process.poll() is not None:
                     break
 
-        if DEBUG:
-            threading.Thread(target=capture_and_debug_log).start()
-        else:
-            threading.Thread(target=capture_only).start()
+        thread = threading.Thread(target=capture_and_debug_log if DEBUG else capture_only)
+        thread.start()
+        return thread
 
     @contextmanager
     def get_logs(self):
@@ -262,7 +262,7 @@ class XRayCore:
         self.process.stdin.flush()
         self.process.stdin.close()
 
-        self.__capture_process_logs()
+        self._log_thread = self.__capture_process_logs()
 
         # execute on start functions
         for func in self._on_start_funcs:
@@ -294,9 +294,66 @@ class XRayCore:
         try:
             logger.warning("Restarting Xray core...")
             self.stop()
-            self.start(config)
+            self._start_with_bind_retry(config)
         finally:
             self.restarting = False
+
+    # Delays (seconds) between successive bind-conflict retries in
+    # _start_with_bind_retry — 3 attempts total (2 retries).
+    _BIND_RETRY_DELAYS = (0.5, 1.0)
+    _BIND_RETRY_PROBE_SECONDS = 0.5
+    _BIND_RETRY_PROBE_INTERVAL = 0.05
+
+    def _start_with_bind_retry(self, config: XRayConfig) -> None:
+        """start(), retrying a couple of times if the freshly-spawned
+        process dies almost immediately with "address already in use".
+
+        The OS can take a brief moment to fully release a listening socket
+        right after the previous Xray process exits (observed in practice
+        on XHTTP/H2 inbounds) — a restart landing in that narrow window
+        would otherwise fail outright even though the very same port binds
+        cleanly a moment later. Only retries a fast, bind-conflict-shaped
+        failure caught within a short probe window; anything else (a
+        different startup error, or a process that's still running past
+        the probe window) is left exactly as before for the caller's own
+        wait_until_ready()/get_logs() to report.
+        """
+        delays = (0.0, *self._BIND_RETRY_DELAYS)
+        for attempt, delay in enumerate(delays, start=1):
+            if delay:
+                time.sleep(delay)
+
+            self.start(config)
+
+            if wait_until_ready(self, timeout=self._BIND_RETRY_PROBE_SECONDS,
+                                 poll_interval=self._BIND_RETRY_PROBE_INTERVAL):
+                return  # survived the probe window — hand off to the caller as usual
+
+            # The process has already exited (wait_until_ready only returns
+            # False once core.started is False), but the background
+            # capture thread reads its stdout asynchronously and may not
+            # have drained the final "Failed to start: ..." line yet.
+            # Join it — its own loop naturally stops at EOF once the dead
+            # process's stdout is fully drained, which is prompt since the
+            # process has already exited — before reading logs, and only
+            # clear self.process afterward. Reading logs first and/or
+            # clearing self.process before the thread catches up races the
+            # thread's `while self.process:` check and can make it exit
+            # having missed the very line we need to classify the failure.
+            log_thread = self._log_thread
+            if log_thread is not None:
+                log_thread.join(timeout=2.0)
+
+            with self.get_logs() as logs:
+                last_log = logs[-1] if logs else ''
+            self.process = None
+
+            if attempt == len(delays) or "address already in use" not in last_log.lower():
+                return  # give up, or not our failure mode — caller reports it as before
+
+            logger.warning(
+                f"Xray failed to bind (attempt {attempt}/{len(delays)}), retrying: {last_log}"
+            )
 
     def on_start(self, func: callable):
         self._on_start_funcs.append(func)
