@@ -168,6 +168,7 @@ class XRayCore:
 
         self.version = self.get_version()
         self.process = None
+        self._log_thread = None
         self.restarting = False
 
         self._logs_buffer = deque(maxlen=100)
@@ -209,10 +210,9 @@ class XRayCore:
                 elif not self.process or self.process.poll() is not None:
                     break
 
-        if DEBUG:
-            threading.Thread(target=capture_and_debug_log).start()
-        else:
-            threading.Thread(target=capture_only).start()
+        thread = threading.Thread(target=capture_and_debug_log if DEBUG else capture_only)
+        thread.start()
+        return thread
 
     @contextmanager
     def get_logs(self):
@@ -262,7 +262,7 @@ class XRayCore:
         self.process.stdin.flush()
         self.process.stdin.close()
 
-        self.__capture_process_logs()
+        self._log_thread = self.__capture_process_logs()
 
         # execute on start functions
         for func in self._on_start_funcs:
@@ -328,6 +328,21 @@ class XRayCore:
             if wait_until_ready(self, timeout=self._BIND_RETRY_PROBE_SECONDS,
                                  poll_interval=self._BIND_RETRY_PROBE_INTERVAL):
                 return  # survived the probe window — hand off to the caller as usual
+
+            # The process has already exited (wait_until_ready only returns
+            # False once core.started is False), but the background
+            # capture thread reads its stdout asynchronously and may not
+            # have drained the final "Failed to start: ..." line yet.
+            # Join it — its own loop naturally stops at EOF once the dead
+            # process's stdout is fully drained, which is prompt since the
+            # process has already exited — before reading logs, and only
+            # clear self.process afterward. Reading logs first and/or
+            # clearing self.process before the thread catches up races the
+            # thread's `while self.process:` check and can make it exit
+            # having missed the very line we need to classify the failure.
+            log_thread = self._log_thread
+            if log_thread is not None:
+                log_thread.join(timeout=2.0)
 
             with self.get_logs() as logs:
                 last_log = logs[-1] if logs else ''
