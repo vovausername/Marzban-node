@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -52,16 +53,32 @@ def _validate_version(version: str) -> str:
     return version
 
 
+_FETCH_TIMEOUT = 120
+_FETCH_ATTEMPTS = 3
+
+
 def _fetch(url: str) -> bytes:
-    try:
-        with urllib.request.urlopen(url, timeout=60) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            raise XrayUpdateError(f"Not found: {url} (does this Xray version/asset exist?)")
-        raise XrayUpdateError(f"Failed to fetch {url}: HTTP {exc.code}")
-    except urllib.error.URLError as exc:
-        raise XrayUpdateError(f"Failed to fetch {url}: {exc.reason}")
+    last_error = ""
+    for attempt in range(1, _FETCH_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=_FETCH_TIMEOUT) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise XrayUpdateError(f"Not found: {url} (does this Xray version/asset exist?)")
+            if exc.code < 500:
+                raise XrayUpdateError(f"Failed to fetch {url}: HTTP {exc.code}")
+            last_error = f"HTTP {exc.code}"
+        except urllib.error.URLError as exc:
+            last_error = str(exc.reason)
+        except OSError as exc:
+            # TimeoutError / ConnectionResetError raised while reading the body
+            last_error = f"{type(exc).__name__}: {exc}"
+
+        if attempt < _FETCH_ATTEMPTS:
+            logger.warning(f"Fetch {url} failed ({last_error}), retry {attempt}/{_FETCH_ATTEMPTS - 1}")
+            time.sleep(2 * attempt)
+    raise XrayUpdateError(f"Failed to fetch {url} after {_FETCH_ATTEMPTS} attempts: {last_error}")
 
 
 def _verify_checksum(asset_bytes: bytes, dgst_text: str, asset_name: str) -> None:
