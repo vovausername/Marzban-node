@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+import zlib
 from uuid import UUID, uuid4
 
 from fastapi import (APIRouter, Body, FastAPI, HTTPException, Request,
@@ -23,6 +24,69 @@ from logger import logger
 from xray import XRayConfig, XRayCore, wait_until_ready
 
 app = FastAPI()
+
+# Upper bound for a decompressed request body. A start config for a large
+# panel is tens of megabytes; this only stops a tiny compressed body from
+# expanding without limit.
+_MAX_DECOMPRESSED_BODY = 512 * 1024 * 1024
+
+
+class GzipRequestMiddleware:
+    """Transparently decompress `Content-Encoding: gzip` request bodies.
+
+    A start/restart config carries every user of every inbound, so it is
+    megabytes of highly repetitive JSON; the panel compresses it when this
+    node advertises the "gzip" feature (see Service.features). Requests
+    without that header pass through untouched.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        headers = scope.get("headers") or []
+        encoding = next((v for k, v in headers if k == b"content-encoding"), b"")
+        if encoding.strip().lower() != b"gzip":
+            return await self.app(scope, receive, send)
+
+        chunks = []
+        more_body = True
+        while more_body:
+            message = await receive()
+            if message["type"] != "http.request":
+                return  # client went away before the body was complete
+            chunks.append(message.get("body", b""))
+            more_body = message.get("more_body", False)
+
+        try:
+            decompressor = zlib.decompressobj(wbits=31)
+            body = decompressor.decompress(b"".join(chunks), _MAX_DECOMPRESSED_BODY)
+            if decompressor.unconsumed_tail or not decompressor.eof:
+                raise ValueError("gzip body is truncated or too large")
+        except (zlib.error, ValueError) as exc:
+            response = JSONResponse(status_code=400, content={"detail": f"Invalid gzip request body: {exc}"})
+            return await response(scope, receive, send)
+
+        scope = dict(scope)
+        scope["headers"] = [
+            (k, v) for k, v in headers if k not in (b"content-encoding", b"content-length")
+        ] + [(b"content-length", str(len(body)).encode())]
+        delivered = False
+
+        async def receive_decompressed():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()
+
+        return await self.app(scope, receive_decompressed, send)
+
+
+app.add_middleware(GzipRequestMiddleware)
 
 
 @app.exception_handler(RequestValidationError)
@@ -62,6 +126,7 @@ class Service(object):
         self.router.add_api_route("/add-outbound", self.add_outbound, methods=["POST"])
         self.router.add_api_route("/remove-inbound", self.remove_inbound, methods=["POST"])
         self.router.add_api_route("/remove-outbound", self.remove_outbound, methods=["POST"])
+        self.router.add_api_route("/sync-users", self.sync_users, methods=["POST"])
         self.router.add_api_route("/update-xray", self.update_xray, methods=["POST"])
         self.router.add_api_route("/check-for-update", self.check_for_update, methods=["POST"])
         self.router.add_api_route("/update-node", self.update_node, methods=["POST"])
@@ -79,39 +144,81 @@ class Service(object):
             )
         return True
 
+    @property
+    def features(self) -> list:
+        """Optional protocol extensions this build understands, so a panel
+        can use them only where they exist (a fleet is rarely all on one
+        node version). Reported in every status response.
+
+        - "keep-core": /connect accepts keep_core (see connect()).
+        - "ping-status": /ping answers with the same status as "/".
+        - "gzip": request bodies may be sent with Content-Encoding: gzip.
+        - "sync-users": /sync-users and drift-proof hot reload on /restart
+          are usable right now (hot reload on, Xray CLI new enough).
+        """
+        features = ["keep-core", "ping-status", "gzip"]
+        try:
+            if XRAY_HOT_RELOAD_ENABLED and xray_hot_reload._cli_supports_user_ops(
+                    getattr(self.core, "version", None)):
+                features.append("sync-users")
+        except Exception:
+            pass
+        return features
+
     def response(self, **kwargs):
         return {
             "connected": self.connected,
             "started": self.core.started,
             "core_version": self.core_version,
+            "features": self.features,
             **kwargs
         }
 
     def base(self):
         return self.response()
 
-    def connect(self, request: Request):
+    def connect(self, request: Request, keep_core: bool = Body(False, embed=True)):
         # core_lock: connect() can stop() a still-running core, which must
         # not interleave with another request's start()/stop()/restart()
         # touching the same core.process.
         with xray_hot_reload.core_lock:
+            previous_client_ip = self.client_ip
             self.session_id = uuid4()
             self.client_ip = request.client.host
 
+            core_kept = False
             if self.connected:
-                logger.warning(
-                    f'New connection from {self.client_ip}, Core control access was taken away from previous client.')
-                if self.core.started:
-                    try:
-                        self.core.stop()
-                    except RuntimeError:
-                        pass
+                # A new session used to always stop the core, so that the
+                # new client starts from a config it sent itself. That made
+                # every panel restart or session loss drop all user
+                # connections on the node. A client that asks for it
+                # (keep_core) takes the running core over instead and then
+                # brings it to its own config with /restart, which only
+                # touches the users that differ. Only possible when that
+                # /restart can be applied hot, and only for the same client
+                # address: the running config routes the Xray API to the
+                # previous client's IP.
+                if (keep_core and self.client_ip == previous_client_ip
+                        and xray_hot_reload.can_keep_core(self.core)):
+                    core_kept = True
+                    logger.info(
+                        f'New session from {self.client_ip}, running core kept for hot takeover.')
+                else:
+                    logger.warning(
+                        f'New connection from {self.client_ip}, '
+                        'Core control access was taken away from previous client.')
+                    if self.core.started:
+                        try:
+                            self.core.stop()
+                        except RuntimeError:
+                            pass
 
             self.connected = True
             logger.info(f'{self.client_ip} connected, Session ID = "{self.session_id}".')
 
             return self.response(
-                session_id=self.session_id
+                session_id=self.session_id,
+                core_kept=core_kept
             )
 
     def disconnect(self):
@@ -133,7 +240,9 @@ class Service(object):
 
     def ping(self, session_id: UUID = Body(embed=True)):
         self.match_session_id(session_id)
-        return {}
+        # Same status as "/", so one request tells a health check both that
+        # the session is still valid and whether the core is running.
+        return self.response()
 
     def start(self, session_id: UUID = Body(embed=True), config: str = Body(embed=True)):
         self.match_session_id(session_id)
@@ -311,6 +420,21 @@ class Service(object):
             except xray_hot_reload.HotReloadError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
             return self.response(detail=output.strip())
+
+    def sync_users(self, session_id: UUID = Body(embed=True), clients: dict = Body(embed=True)):
+        """Bring the running core's users to `clients` ({inbound tag:
+        [client, ...]}) without ever restarting it. 501 when user hot-ops
+        can't be used on this node (the panel then syncs users its own
+        way), 503 when the core isn't running, 500 on a failed apply."""
+        self.match_session_id(session_id)
+        try:
+            stats = xray_hot_reload.sync_users(self.core, clients)
+        except xray_hot_reload.HotReloadUnavailable as exc:
+            raise HTTPException(status_code=503 if not self.core.started else 501, detail=str(exc))
+        except xray_hot_reload.HotReloadError as exc:
+            logger.warning(f"User sync failed: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc))
+        return self.response(**stats)
 
     def update_xray(self, session_id: UUID = Body(embed=True), version: str = Body(embed=True)):
         self.match_session_id(session_id)
