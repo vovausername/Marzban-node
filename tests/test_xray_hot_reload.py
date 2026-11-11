@@ -255,7 +255,7 @@ def test_reconcile_is_a_no_op_when_live_tracked_and_wanted_agree(monkeypatch):
     stats = hr.reconcile_users(core, {"a": [_c("1.a"), _c("2.b")]})
 
     assert fake.calls == ["inbounduser"]
-    assert stats == {"added": 0, "removed": 0, "unchanged": 2, "skipped_tags": []}
+    assert stats == {"added": 0, "removed": 0, "unchanged": 2, "skipped_tags": [], "pending_users": {}}
 
 
 def test_reconcile_collapses_duplicate_live_entries(monkeypatch):
@@ -567,3 +567,56 @@ def test_nothing_is_removed_anywhere_when_such_an_inbound_would_need_an_add(monk
             raise AssertionError("expected HotReloadError")
         assert fake.live == {"a": ["9.ghost"], "hy": ["1.a"]}
         assert "rmu" not in fake.calls and "adu" not in fake.calls
+
+
+def test_allow_pending_syncs_everything_else_and_reports_what_it_could_not_add(monkeypatch):
+    # The Hysteria inbound needs one user added and one replaced: with
+    # allow_pending neither blocks the vless inbound, both are reported, and
+    # the user to replace keeps its current account until the caller swaps it.
+    config = _hysteria_config([])
+    config["inbounds"].insert(0, {"tag": "a", "protocol": "vless", "settings": {"clients": []}})
+    core = _Core(config)
+    fake = FakeXray({"a": ["9.ghost"], "hy": ["1.a", "8.gone"]})
+    fake.accounts[("hy", "1.a")] = {"auth": "stale"}
+    _use_fake_xray(monkeypatch, fake)
+
+    stats = hr.reconcile_users(core, {
+        "a": [_c("2.b")],
+        "hy": [{"email": "1.a", "auth": "pw-1"}, {"email": "2.b", "auth": "pw-2"}],
+    }, allow_pending=True)
+
+    assert fake.live == {"a": ["2.b"], "hy": ["1.a"]}  # 8.gone removed, 1.a untouched
+    assert stats["pending_users"] == {"hy": ["1.a", "2.b"]}
+    assert (stats["added"], stats["removed"]) == (1, 2)
+
+
+def test_allow_pending_reports_nothing_when_such_an_inbound_is_in_sync(monkeypatch):
+    core = _Core(_hysteria_config([]))
+    fake = FakeXray({"hy": ["1.a"]})
+    fake.accounts[("hy", "1.a")] = {"auth": "pw-1"}
+    _use_fake_xray(monkeypatch, fake)
+
+    stats = hr.reconcile_users(core, {"hy": [{"email": "1.a", "auth": "pw-1"}]}, allow_pending=True)
+
+    assert stats["pending_users"] == {}
+    assert fake.calls == ["inbounduser"]
+
+
+def test_hot_reload_returns_pending_users_instead_of_demanding_a_restart(monkeypatch):
+    core = _Core(_hysteria_config([{"email": "1.a", "auth": "pw-1"}]))
+    fake = FakeXray({"hy": ["1.a"]})
+    fake.accounts[("hy", "1.a")] = {"auth": "pw-1"}
+    _use_fake_xray(monkeypatch, fake)
+    new_config = _hysteria_config([{"email": "1.a", "auth": "pw-1"}, {"email": "2.b", "auth": "pw-2"}])
+
+    assert hr.try_hot_reload(core, new_config) is False          # strict: full restart
+    stats = hr.hot_reload(core, new_config, allow_pending=True)  # asked: hot + pending
+    assert stats["pending_users"] == {"hy": ["2.b"]}
+    assert core.config is new_config
+
+
+def test_masque_password_is_verified_against_the_config_pass_field():
+    # MASQUE accounts carry `password`; inbound client entries call it `pass`.
+    m = hr._live_account_matches
+    assert m({"password": "p"}, {"pass": "p", "email": "1.a"}) is True
+    assert m({"password": "p"}, {"pass": "other"}) is False

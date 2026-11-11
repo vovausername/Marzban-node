@@ -154,7 +154,8 @@ class Service(object):
         - "ping-status": /ping answers with the same status as "/".
         - "gzip": request bodies may be sent with Content-Encoding: gzip.
         - "sync-users": /sync-users and drift-proof hot reload on /restart
-          are usable right now (hot reload on, Xray CLI new enough).
+          are usable right now (hot reload on, Xray CLI new enough). Both
+          take allow_pending and answer with pending_users.
         """
         features = ["keep-core", "ping-status", "gzip"]
         try:
@@ -290,7 +291,8 @@ class Service(object):
 
             return self.response()
 
-    def restart(self, session_id: UUID = Body(embed=True), config: str = Body(embed=True)):
+    def restart(self, session_id: UUID = Body(embed=True), config: str = Body(embed=True),
+                allow_pending: bool = Body(False, embed=True)):
         self.match_session_id(session_id)
 
         try:
@@ -313,8 +315,13 @@ class Service(object):
             # connections (core.config updated inside). Any other
             # difference (or hot-path error) falls through to the full
             # restart below.
-            if xray_hot_reload.try_hot_reload(self.core, config):
-                return self.response()
+            # allow_pending: on inbounds whose users the Xray CLI can't
+            # add (e.g. Hysteria), report the users that still need adding
+            # as pending_users instead of giving up on the hot path — only
+            # for a caller that asked, since it has to push them itself.
+            stats = xray_hot_reload.hot_reload(self.core, config, allow_pending=allow_pending)
+            if stats is not None:
+                return self.response(hot_reloaded=True, **stats)
 
             try:
                 self.core.restart(config)
@@ -421,14 +428,15 @@ class Service(object):
                 raise HTTPException(status_code=400, detail=str(exc))
             return self.response(detail=output.strip())
 
-    def sync_users(self, session_id: UUID = Body(embed=True), clients: dict = Body(embed=True)):
+    def sync_users(self, session_id: UUID = Body(embed=True), clients: dict = Body(embed=True),
+                   allow_pending: bool = Body(False, embed=True)):
         """Bring the running core's users to `clients` ({inbound tag:
         [client, ...]}) without ever restarting it. 501 when user hot-ops
         can't be used on this node (the panel then syncs users its own
         way), 503 when the core isn't running, 500 on a failed apply."""
         self.match_session_id(session_id)
         try:
-            stats = xray_hot_reload.sync_users(self.core, clients)
+            stats = xray_hot_reload.sync_users(self.core, clients, allow_pending=allow_pending)
         except xray_hot_reload.HotReloadUnavailable as exc:
             raise HTTPException(status_code=503 if not self.core.started else 501, detail=str(exc))
         except xray_hot_reload.HotReloadError as exc:

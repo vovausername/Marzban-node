@@ -301,3 +301,20 @@ def test_hysteria_users_are_verified_and_removed_but_never_cut_off(xray):
         {"auth": "h2", "email": "2.b"}]
     assert hr.try_hot_reload(xray, new_config) is False
     assert _live("hy") == ["1.Alice"]
+
+
+def test_allow_pending_keeps_hysteria_from_blocking_the_rest(xray):
+    hy = [{"auth": "h1", "email": "1.Alice"}]
+    _push_directly("vless", _definition(xray, "vless"), [_vless("9.ghost", 9)])
+
+    stats = hr.sync_users(xray, {
+        "vless": [_vless("1.Alice", 1), _vless("2.b", 2)],
+        "hy": [{"auth": "rotated", "email": "1.Alice"}, {"auth": "h2", "email": "2.b"}],
+    }, allow_pending=True)
+
+    assert _live("vless") == ["1.Alice", "2.b"]
+    assert _live("hy") == ["1.Alice"]  # still on its old account, not cut off
+    assert stats["pending_users"] == {"hy": ["1.Alice", "2.b"]}
+
+    # In sync again once nothing is pending.
+    assert hr.sync_users(xray, {"hy": hy}, allow_pending=True)["pending_users"] == {}

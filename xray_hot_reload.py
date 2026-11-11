@@ -411,6 +411,14 @@ def _cipher_name(value) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(value).upper()).replace("IETF", "")
 
 
+_CREDENTIAL_NAMES = {
+    "id": ("id",),
+    "password": ("password", "pass"),
+    "auth": ("auth",),
+    "key": ("password",),
+}
+
+
 def _live_account_matches(account: dict, client: dict):
     """Whether the live `account` of a user (as `api inbounduser` prints it)
     carries the credentials of the wanted config `client`.
@@ -424,8 +432,10 @@ def _live_account_matches(account: dict, client: dict):
         if key == "_TypedMessage_":
             continue
         if key in ("id", "password", "auth", "key"):
-            # Shadowsocks 2022 reports the user's key; configs call it password.
-            wanted = client.get("password" if key == "key" else key)
+            # The same credential under the names configs use for it:
+            # Shadowsocks 2022 reports the user's key (config: password),
+            # MASQUE reports password (config: pass).
+            wanted = next((client[name] for name in _CREDENTIAL_NAMES[key] if client.get(name) is not None), None)
             if wanted is None:
                 return False
             wanted, value = str(wanted), str(value)
@@ -466,7 +476,8 @@ def _set_tracked_clients(core, tag: str, clients: list) -> None:
             return
 
 
-def reconcile_users(core, desired_by_tag: dict, inbound_defs: dict = None) -> dict:
+def reconcile_users(core, desired_by_tag: dict, inbound_defs: dict = None,
+                    allow_pending: bool = False) -> dict:
     """Make the live process hold exactly `desired_by_tag[tag]` on each
     listed inbound, without restarting it.
 
@@ -484,8 +495,11 @@ def reconcile_users(core, desired_by_tag: dict, inbound_defs: dict = None) -> di
     already tracks exactly the wanted entry), and is removed + re-added
     otherwise. Duplicate live entries for one email are collapsed the same
     way. On an inbound whose protocol `xray api adu` can't add users to
-    (see _ADU_PROTOCOLS) users are only ever removed; if it would need one
-    added or replaced the whole call fails before touching anything.
+    (see _ADU_PROTOCOLS) users are only ever removed. The users such an
+    inbound would need added or replaced are left exactly as they are and
+    returned as "pending_users" when `allow_pending` is set — the caller
+    promises to push those itself (the panel can, over Xray's gRPC API);
+    without it the whole call fails before touching anything.
 
     `inbound_defs` supplies the inbound definitions to build `adu` payloads
     from (the CLI needs a complete inbound); core.config's own are used
@@ -494,7 +508,8 @@ def reconcile_users(core, desired_by_tag: dict, inbound_defs: dict = None) -> di
     a client list with a missing/repeated email) is skipped when its client
     list is the one already tracked, and fails the call otherwise.
 
-    Returns {"added", "removed", "unchanged", "skipped_tags"}. Raises
+    Returns {"added", "removed", "unchanged", "skipped_tags",
+    "pending_users": {tag: [email, ...]}}. Raises
     HotReloadError on any failure; core.config then reflects the removals
     already applied, and the next call re-reads the live state anyway.
     """
@@ -509,6 +524,7 @@ def reconcile_users(core, desired_by_tag: dict, inbound_defs: dict = None) -> di
     # replace, clients to add)
     plans = []
     skipped_tags = []
+    pending_users = {}
     unchanged = 0
     for tag, clients in desired_by_tag.items():
         inbound = running.get(tag)
@@ -560,13 +576,21 @@ def reconcile_users(core, desired_by_tag: dict, inbound_defs: dict = None) -> di
         to_add = [client for email, client in desired.items() if email not in live]
 
         if (to_add or to_replace) and inbound.get("protocol") not in _ADU_PROTOCOLS:
-            # Decided here, before anything is removed anywhere: removing a
-            # user this can't add back would cut them off until the caller's
-            # fallback (full restart / per-user sync) gets to them.
-            raise HotReloadError(
-                f"inbound {tag!r} ({inbound.get('protocol')}) needs users added, "
-                "which `xray api adu` can't do for this protocol"
+            if not allow_pending:
+                # Decided here, before anything is removed anywhere: removing
+                # a user this can't add back would cut them off until the
+                # caller's fallback (full restart / per-user sync) gets to them.
+                raise HotReloadError(
+                    f"inbound {tag!r} ({inbound.get('protocol')}) needs users added, "
+                    "which `xray api adu` can't do for this protocol"
+                )
+            # Hand them to the caller untouched: a user to replace keeps its
+            # current account until the caller swaps it.
+            pending_users[tag] = (
+                [client["email"] for _occurrences, client in to_replace]
+                + [client["email"] for client in to_add]
             )
+            to_replace, to_add = [], []
         plans.append((tag, clients, to_drop, to_replace, to_add))
 
     def _rmu(tag, emails):
@@ -631,7 +655,8 @@ def reconcile_users(core, desired_by_tag: dict, inbound_defs: dict = None) -> di
     for tag, clients, _to_drop, _to_replace, _to_add in plans:
         _set_tracked_clients(core, tag, json.loads(json.dumps(clients)))
 
-    return {"added": added, "removed": removed, "unchanged": unchanged, "skipped_tags": skipped_tags}
+    return {"added": added, "removed": removed, "unchanged": unchanged,
+            "skipped_tags": skipped_tags, "pending_users": pending_users}
 
 
 def _user_ops_available(core) -> bool:
@@ -650,7 +675,12 @@ def can_keep_core(core) -> bool:
         return bool(core.started and _user_ops_available(core))
 
 
-def sync_users(core, clients_by_tag: dict) -> dict:
+def _pending_note(stats: dict) -> str:
+    pending = sum(len(emails) for emails in stats.get("pending_users", {}).values())
+    return f", {pending} left to the panel on {', '.join(map(str, stats['pending_users']))}" if pending else ""
+
+
+def sync_users(core, clients_by_tag: dict, allow_pending: bool = False) -> dict:
     """Bring the running process's users to `clients_by_tag` ({inbound tag:
     [client, ...]}, the same client entries a start config carries) — the
     panel's "resync this node" in one call instead of several gRPC calls
@@ -666,10 +696,10 @@ def sync_users(core, clients_by_tag: dict) -> dict:
                 "user hot-ops are unavailable (XRAY_HOT_RELOAD_ENABLED is off, "
                 "or this Xray lacks `api adu`/`rmu`/`inbounduser`)"
             )
-        stats = reconcile_users(core, clients_by_tag)
+        stats = reconcile_users(core, clients_by_tag, allow_pending=allow_pending)
         logger.info(
             f"Synced users without restart: +{stats['added']} -{stats['removed']} "
-            f"={stats['unchanged']}"
+            f"={stats['unchanged']}" + _pending_note(stats)
             + (f", unknown inbound(s) skipped: {', '.join(map(str, stats['skipped_tags']))}"
                if stats["skipped_tags"] else "")
         )
@@ -677,43 +707,51 @@ def sync_users(core, clients_by_tag: dict) -> dict:
 
 
 def try_hot_reload(core, new_config: dict) -> bool:
+    """hot_reload() as a yes/no: True when `new_config` is fully in effect
+    without a restart, False when the caller must do the full restart."""
+    return hot_reload(core, new_config) is not None
+
+
+def hot_reload(core, new_config: dict, allow_pending: bool = False):
     """Try to bring the running core to `new_config` without restarting it.
 
-    True means the config is now in effect and core.config has been
-    updated — the caller reports success without touching the process
-    (users were reconciled against the live process, or nothing needed
-    changing). False means the caller must do the normal full restart —
-    including after any hot-path error, since the full restart re-applies
-    the complete new config and therefore re-syncs the live state no
-    matter how far the hot path got. Callers should hold core_lock across
-    this call AND their fallback restart + core.config assignment, so
-    overlapping restart requests can't diff against a core.config another
-    thread is still updating.
+    Returns the reconcile counters (see reconcile_users) when the config is
+    now in effect and core.config has been updated — the caller reports
+    success without touching the process (users were reconciled against the
+    live process, or nothing needed changing). With `allow_pending`, users
+    this could not add (see reconcile_users) are listed under
+    "pending_users" for the caller to push. Returns None when the caller
+    must do the normal full restart — including after any hot-path error,
+    since the full restart re-applies the complete new config and therefore
+    re-syncs the live state no matter how far the hot path got. Callers
+    should hold core_lock across this call AND their fallback restart +
+    core.config assignment, so overlapping restart requests can't diff
+    against a core.config another thread is still updating.
     """
     with core_lock:
         if not XRAY_HOT_RELOAD_ENABLED:
-            return False
+            return None
         if not core.started:
-            return False
+            return None
         old_config = getattr(core, "config", None)
         if old_config is None:
-            return False
+            return None
 
         old_stripped, old_clients = _strip_clients(old_config)
         new_stripped, new_clients = _strip_clients(new_config)
         if not _same_structure(old_stripped, new_stripped):
-            return False
+            return None
 
         if not _cli_supports_user_ops(getattr(core, "version", None)):
             if old_clients == new_clients:
                 logger.info("Config unchanged, skipping Xray restart")
                 core.config = new_config
-                return True
+                return {"added": 0, "removed": 0, "unchanged": 0, "skipped_tags": [], "pending_users": {}}
             logger.warning(
                 f"Xray {getattr(core, 'version', None)} lacks `api adu`/`rmu`/`inbounduser` "
                 "(needs >= 25.7.26); falling back to full restart"
             )
-            return False
+            return None
 
         # Every inbound that has, or had, a client list. One whose "clients"
         # key is gone from the new config must lose its users too.
@@ -734,16 +772,17 @@ def try_hot_reload(core, new_config: dict) -> bool:
             definitions[tag] = inbound
 
         try:
-            stats = reconcile_users(core, desired, definitions)
+            stats = reconcile_users(core, desired, definitions, allow_pending=allow_pending)
         except Exception as exc:
             logger.warning(f"Hot reload failed ({exc}), falling back to full restart")
-            return False
+            return None
 
         if stats["added"] or stats["removed"]:
             logger.info(
                 f"Hot-reloaded users without restart: +{stats['added']} -{stats['removed']}"
+                + _pending_note(stats)
             )
         else:
-            logger.info("Config and live users unchanged, skipping Xray restart")
+            logger.info("Config and live users unchanged, skipping Xray restart" + _pending_note(stats))
         core.config = new_config
-        return True
+        return stats

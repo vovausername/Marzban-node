@@ -159,7 +159,8 @@ def test_start_that_never_stays_up_returns_503(client, svc, monkeypatch):
 
 def test_restart_uses_hot_reload_and_skips_full_restart(client, svc, monkeypatch):
     sid = _connect(client)
-    monkeypatch.setattr(xray_hot_reload, "try_hot_reload", lambda core, cfg: True)
+    monkeypatch.setattr(xray_hot_reload, "hot_reload", lambda core, cfg, allow_pending=False: {
+        "added": 1, "removed": 0, "unchanged": 2, "skipped_tags": [], "pending_users": {}})
     restart_calls = []
     monkeypatch.setattr(svc.core, "restart", lambda cfg: restart_calls.append(cfg))
     config = json.dumps({"inbounds": [], "outbounds": []})
@@ -172,7 +173,7 @@ def test_restart_uses_hot_reload_and_skips_full_restart(client, svc, monkeypatch
 
 def test_restart_falls_back_to_full_restart_when_hot_reload_declines(client, svc, monkeypatch):
     sid = _connect(client)
-    monkeypatch.setattr(xray_hot_reload, "try_hot_reload", lambda core, cfg: False)
+    monkeypatch.setattr(xray_hot_reload, "hot_reload", lambda core, cfg, allow_pending=False: None)
     monkeypatch.setattr(rest_service, "wait_until_ready", lambda core: True)
     config = json.dumps({"inbounds": [], "outbounds": []})
 
@@ -309,7 +310,7 @@ def test_sync_users_returns_the_reconcile_counters(client, svc, monkeypatch):
     svc.core.started = True
     seen = {}
 
-    def fake_sync(core, clients):
+    def fake_sync(core, clients, allow_pending=False):
         seen["clients"] = clients
         return {"added": 2, "removed": 1, "unchanged": 5, "skipped_tags": ["gone"]}
 
@@ -349,7 +350,7 @@ def test_sync_users_apply_failure_is_500_and_never_restarts(client, svc, monkeyp
     restart_calls = []
     monkeypatch.setattr(svc.core, "restart", lambda cfg: restart_calls.append(cfg))
 
-    def boom(core, clients):
+    def boom(core, clients, allow_pending=False):
         raise xray_hot_reload.HotReloadError("adu failed")
 
     monkeypatch.setattr(xray_hot_reload, "sync_users", boom)
@@ -383,3 +384,55 @@ def test_invalid_gzip_request_body_is_rejected(client, svc):
 
     assert res.status_code == 400
     assert svc.core.started is False
+
+
+# --- allow_pending: users the node can't add itself are handed to the panel ---
+
+def test_restart_reports_pending_users_only_to_a_caller_that_asked(client, svc, monkeypatch):
+    sid = _connect(client)
+    seen = []
+
+    def fake_hot_reload(core, cfg, allow_pending=False):
+        seen.append(allow_pending)
+        return {"added": 0, "removed": 0, "unchanged": 0, "skipped_tags": [],
+                "pending_users": {"hy": ["1.a"]} if allow_pending else {}}
+
+    monkeypatch.setattr(xray_hot_reload, "hot_reload", fake_hot_reload)
+    config = json.dumps({"inbounds": [], "outbounds": []})
+
+    plain = client.post("/restart", json={"session_id": sid, "config": config}).json()
+    asked = client.post("/restart", json={"session_id": sid, "config": config, "allow_pending": True}).json()
+
+    assert seen == [False, True]
+    assert plain["pending_users"] == {} and plain["hot_reloaded"] is True
+    assert asked["pending_users"] == {"hy": ["1.a"]}
+
+
+def test_full_restart_answer_carries_no_pending_users(client, svc, monkeypatch):
+    # After a real restart Xray has every user of the config; nothing to push.
+    sid = _connect(client)
+    monkeypatch.setattr(xray_hot_reload, "hot_reload", lambda core, cfg, allow_pending=False: None)
+    monkeypatch.setattr(rest_service, "wait_until_ready", lambda core: True)
+    config = json.dumps({"inbounds": [], "outbounds": []})
+
+    data = client.post("/restart", json={"session_id": sid, "config": config, "allow_pending": True}).json()
+
+    assert "pending_users" not in data and "hot_reloaded" not in data
+
+
+def test_sync_users_passes_allow_pending_through(client, svc, monkeypatch):
+    sid = _connect(client)
+    svc.core.started = True
+    seen = []
+
+    def fake_sync(core, clients, allow_pending=False):
+        seen.append(allow_pending)
+        return {"added": 0, "removed": 0, "unchanged": 0, "skipped_tags": [], "pending_users": {"hy": ["2.b"]}}
+
+    monkeypatch.setattr(xray_hot_reload, "sync_users", fake_sync)
+
+    client.post("/sync-users", json={"session_id": sid, "clients": {}})
+    data = client.post("/sync-users", json={"session_id": sid, "clients": {}, "allow_pending": True}).json()
+
+    assert seen == [False, True]
+    assert data["pending_users"] == {"hy": ["2.b"]}

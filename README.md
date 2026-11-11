@@ -115,10 +115,14 @@ behaviour.
   was last started with, which is stale as soon as the panel adds or
   removes a user through Xray's gRPC API directly.
   `xray api adu` can only add users to vless/vmess/trojan/shadowsocks
-  inbounds. On any other inbound (e.g. Hysteria) users are verified and
-  removed hot, but a config that needs one added or replaced there is
-  refused before anything is touched: `/restart` then does a full restart,
-  `/sync-users` answers `500` and the panel syncs that node user by user.
+  inbounds. On any other inbound (Hysteria, MASQUE) users are verified and
+  removed hot, but can't be added or replaced here. A caller that sends
+  `allow_pending: true` (with `/restart` or `/sync-users`) gets everything
+  else synced and those users back as `pending_users: {inbound tag:
+  [email, ...]}`, untouched, to push itself over Xray's gRPC API — which is
+  what the panel does. Without the flag such a config is refused before
+  anything is touched: `/restart` does a full restart, `/sync-users`
+  answers `500`.
 - **`POST /sync-users`** (`session_id`, `clients: {inbound tag: [client,
   ...]}`) does only that reconciliation and never restarts or stops the
   core: `501` if hot user operations are unavailable on this node, `503`
