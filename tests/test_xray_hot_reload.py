@@ -8,7 +8,7 @@ import xray_hot_reload as hr
 def _config(clients_a, clients_b=None, port=443):
     inbounds = [
         {"tag": "a", "protocol": "vless", "port": port,
-         "settings": {"clients": clients_a}},
+         "settings": {"clients": list(clients_a)}},
     ]
     if clients_b is not None:
         inbounds.append({
@@ -102,3 +102,592 @@ def test_expect_total_raises_on_mismatched_count():
         pass
     else:
         raise AssertionError("expected HotReloadError")
+
+
+def test_strip_clients_does_not_mutate_or_copy_the_client_lists():
+    clients = [{"email": "u1", "id": "uuid-1"}]
+    config = _config(clients)
+
+    stripped, by_tag = hr._strip_clients(config)
+
+    assert config["inbounds"][0]["settings"] == {"clients": clients}
+    assert "clients" not in stripped["inbounds"][0]["settings"]
+    assert by_tag["a"] is config["inbounds"][0]["settings"]["clients"]
+
+
+def test_expect_added_treats_already_exists_as_success():
+    stdout = ("add user: 1.a\nrpc error: code = Unknown desc = proxy/vless: User 1.a already exists.\n"
+              "add user: 2.b\nresult: ok\nAdded 1 user(s) in total.")
+    hr._expect_added(stdout, ["1.a", "2.b"])  # no raise
+
+
+def test_expect_added_raises_on_genuine_failure():
+    stdout = "add user: 1.a\nrpc error: something else\nAdded 0 user(s) in total."
+    try:
+        hr._expect_added(stdout, ["1.a"])
+    except hr.HotReloadError:
+        pass
+    else:
+        raise AssertionError("expected HotReloadError")
+
+
+# --- reconcile_users()/try_hot_reload()/sync_users() against a fake live Xray ---
+
+class FakeXray:
+    """Stands in for _run_xray_api(): keeps a per-inbound user list like a
+    running Xray and answers `inbounduser`/`rmu`/`adu` with the real CLI's
+    output format (captured from Xray v26.7.28)."""
+
+    def __init__(self, live, not_user_managers=()):
+        self.live = {tag: list(emails) for tag, emails in live.items()}
+        self.not_user_managers = set(not_user_managers)
+        self.calls = []
+        self.fail_adu = False
+        self.accounts = {}  # (tag, email) -> account as `inbounduser` prints it
+        self.levels = {}  # (tag, email) -> policy level (Xray omits 0)
+        self.listing_error = None  # e.g. "failed to dial 127.0.0.1:62052"
+
+    def __call__(self, args, payload=None, timeout=3):
+        import json
+        self.calls.append(args[0])
+        if args[0] == "inbounduser":
+            tag = args[1].split("=", 1)[1]
+            if tag in self.not_user_managers or tag not in self.live:
+                raise hr.HotReloadError("xray api inbounduser failed: proxy is not a UserManager")
+            if self.listing_error:
+                raise hr.HotReloadError(self.listing_error)
+            users = [{"account": self.accounts.get((tag, email), {}), "email": email,
+                      **({"level": self.levels[(tag, email)]} if self.levels.get((tag, email)) else {})}
+                     for email in self.live[tag]]
+            return json.dumps({"users": users} if users else {})
+        if args[0] == "rmu":
+            tag = args[1].split("=", 1)[1]
+            out, removed = [], 0
+            for email in args[2:]:
+                out.append(f"remove user: {email}")
+                if email in self.live[tag]:
+                    self.live[tag].remove(email)
+                    removed += 1
+                else:
+                    out.append(f"rpc error: code = Unknown desc = proxy/vless: User {email} not found.")
+            out.append(f"Removed {removed} user(s) in total.")
+            return "\n".join(out)
+        if args[0] == "adu":
+            if self.fail_adu:
+                return "Added 0 user(s) in total."
+            out, added = [], 0
+            for inbound in json.loads(payload)["inbounds"]:
+                assert inbound.get("protocol"), "adu needs a complete inbound definition"
+                out.append(f"processing inbound: {inbound['tag']}")
+                if inbound["protocol"] not in ("vless", "vmess", "trojan", "shadowsocks"):
+                    out.append("unsupported inbound type")
+                    continue
+                for client in inbound["settings"]["clients"]:
+                    out.append(f"add user: {client['email']}")
+                    if client["email"] in self.live[inbound["tag"]]:
+                        out.append("rpc error: code = Unknown desc = proxy/vless: "
+                                   f"User {client['email']} already exists.")
+                    else:
+                        self.live[inbound["tag"]].append(client["email"])
+                        out.append("result: ok")
+                        added += 1
+            out.append(f"Added {added} user(s) in total.")
+            return "\n".join(out)
+        raise AssertionError(f"unexpected xray api call: {args}")
+
+
+class _Core:
+    version = "26.7.28"
+    started = True
+
+    def __init__(self, config):
+        self.config = config
+
+
+def _use_fake_xray(monkeypatch, fake):
+    monkeypatch.setattr(hr, "_run_xray_api", fake)
+    monkeypatch.setattr(hr, "_cli_supports_user_ops", lambda version: True)
+    monkeypatch.setattr(hr, "XRAY_HOT_RELOAD_ENABLED", True)
+
+
+def _c(email, uid=None):
+    return {"email": email, "id": uid or f"uuid-{email}"}
+
+
+def test_reconcile_removes_live_users_the_node_never_tracked(monkeypatch):
+    # "9.ghost" was added by the panel over gRPC and its removal got lost:
+    # core.config never knew it, so a diff against core.config can't see it.
+    core = _Core(_config([_c("1.a")]))
+    fake = FakeXray({"a": ["1.a", "9.ghost"]})
+    _use_fake_xray(monkeypatch, fake)
+
+    stats = hr.reconcile_users(core, {"a": [_c("1.a")]})
+
+    assert fake.live["a"] == ["1.a"]
+    assert (stats["added"], stats["removed"], stats["unchanged"]) == (0, 1, 1)
+
+
+def test_reconcile_restores_a_tracked_user_missing_from_the_live_process(monkeypatch):
+    core = _Core(_config([_c("1.a"), _c("2.b")]))
+    fake = FakeXray({"a": ["1.a"]})
+    _use_fake_xray(monkeypatch, fake)
+
+    stats = hr.reconcile_users(core, {"a": [_c("1.a"), _c("2.b")]})
+
+    assert sorted(fake.live["a"]) == ["1.a", "2.b"]
+    assert (stats["added"], stats["removed"]) == (1, 0)
+
+
+def test_reconcile_repushes_a_live_user_whose_credentials_are_unverified(monkeypatch):
+    # Live but untracked (pushed by the panel directly): its credentials
+    # may be stale, so it is removed and re-added with the wanted entry.
+    core = _Core(_config([]))
+    fake = FakeXray({"a": ["1.a"]})
+    _use_fake_xray(monkeypatch, fake)
+
+    stats = hr.reconcile_users(core, {"a": [_c("1.a", "rotated")]})
+
+    assert fake.calls == ["inbounduser", "rmu", "adu"]
+    assert (stats["added"], stats["removed"]) == (1, 1)
+    assert core.config["inbounds"][0]["settings"]["clients"] == [_c("1.a", "rotated")]
+
+
+def test_reconcile_is_a_no_op_when_live_tracked_and_wanted_agree(monkeypatch):
+    core = _Core(_config([_c("1.a"), _c("2.b")]))
+    fake = FakeXray({"a": ["1.a", "2.b"]})
+    _use_fake_xray(monkeypatch, fake)
+
+    stats = hr.reconcile_users(core, {"a": [_c("1.a"), _c("2.b")]})
+
+    assert fake.calls == ["inbounduser"]
+    assert stats == {"added": 0, "removed": 0, "unchanged": 2, "skipped_tags": [], "pending_users": {}}
+
+
+def test_reconcile_collapses_duplicate_live_entries(monkeypatch):
+    # A classic Shadowsocks inbound accepts the same email twice.
+    core = _Core(_config([_c("1.a")]))
+    fake = FakeXray({"a": ["1.a", "1.a"]})
+    _use_fake_xray(monkeypatch, fake)
+
+    hr.reconcile_users(core, {"a": [_c("1.a")]})
+
+    assert fake.live["a"] == ["1.a"]
+
+
+def test_reconcile_matches_emails_case_insensitively(monkeypatch):
+    core = _Core(_config([_c("1.Alice")]))
+    fake = FakeXray({"a": ["1.alice"]})
+    _use_fake_xray(monkeypatch, fake)
+
+    stats = hr.reconcile_users(core, {"a": [_c("1.Alice")]})
+
+    assert fake.calls == ["inbounduser"]
+    assert stats["unchanged"] == 1
+
+
+def test_reconcile_skips_unknown_and_protected_tags(monkeypatch):
+    core = _Core(_config([_c("1.a")]))
+    fake = FakeXray({"a": ["1.a"]})
+    _use_fake_xray(monkeypatch, fake)
+
+    stats = hr.reconcile_users(core, {"a": [_c("1.a")], "nope": [_c("1.a")], "API_INBOUND": []})
+
+    assert sorted(stats["skipped_tags"]) == ["API_INBOUND", "nope"]
+
+
+def test_reconcile_skips_an_unchanged_inbound_that_is_not_user_manageable(monkeypatch):
+    core = _Core(_config([_c("1.a")]))
+    fake = FakeXray({}, not_user_managers={"a"})
+    _use_fake_xray(monkeypatch, fake)
+
+    stats = hr.reconcile_users(core, {"a": [_c("1.a")]})
+
+    assert stats["added"] == stats["removed"] == 0
+
+
+def test_reconcile_fails_when_a_non_user_manageable_inbound_would_change(monkeypatch):
+    core = _Core(_config([_c("1.a")]))
+    _use_fake_xray(monkeypatch, FakeXray({}, not_user_managers={"a"}))
+
+    try:
+        hr.reconcile_users(core, {"a": [_c("2.b")]})
+    except hr.HotReloadError:
+        pass
+    else:
+        raise AssertionError("expected HotReloadError")
+
+
+def test_reconcile_rejects_a_client_list_with_repeated_emails(monkeypatch):
+    core = _Core(_config([]))
+    _use_fake_xray(monkeypatch, FakeXray({"a": []}))
+
+    try:
+        hr.reconcile_users(core, {"a": [_c("1.a"), _c("1.A")]})
+    except hr.HotReloadError:
+        pass
+    else:
+        raise AssertionError("expected HotReloadError")
+
+
+def test_reconcile_chunks_large_removals(monkeypatch):
+    emails = [f"{i}.u" for i in range(5)]
+    core = _Core(_config([_c(e) for e in emails]))
+    fake = FakeXray({"a": emails})
+    _use_fake_xray(monkeypatch, fake)
+    monkeypatch.setattr(hr, "_RMU_CHUNK", 2)
+
+    stats = hr.reconcile_users(core, {"a": []})
+
+    assert fake.calls.count("rmu") == 3
+    assert fake.live["a"] == []
+    assert stats["removed"] == 5
+
+
+def test_reconcile_chunks_large_additions(monkeypatch):
+    core = _Core(_config([], []))
+    fake = FakeXray({"a": [], "b": []})
+    _use_fake_xray(monkeypatch, fake)
+    monkeypatch.setattr(hr, "_ADU_CHUNK", 2)
+
+    stats = hr.reconcile_users(core, {"a": [_c(f"{i}.u") for i in range(3)], "b": [_c("9.z")]})
+
+    assert fake.calls.count("adu") == 2
+    assert len(fake.live["a"]) == 3 and fake.live["b"] == ["9.z"]
+    assert stats["added"] == 4
+
+
+def test_failed_add_leaves_tracked_config_without_the_unapplied_users(monkeypatch):
+    core = _Core(_config([_c("1.a")]))
+    fake = FakeXray({"a": ["1.a"]})
+    fake.fail_adu = True
+    _use_fake_xray(monkeypatch, fake)
+
+    try:
+        hr.reconcile_users(core, {"a": [_c("1.a"), _c("2.b")]})
+    except hr.HotReloadError:
+        pass
+    else:
+        raise AssertionError("expected HotReloadError")
+    assert core.config["inbounds"][0]["settings"]["clients"] == [_c("1.a")]
+
+
+def test_try_hot_reload_heals_drift_even_when_configs_are_identical(monkeypatch):
+    config = _config([_c("1.a")])
+    core = _Core(config)
+    fake = FakeXray({"a": ["1.a", "9.ghost"]})
+    _use_fake_xray(monkeypatch, fake)
+    new_config = _config([_c("1.a")])
+
+    assert hr.try_hot_reload(core, new_config) is True
+    assert fake.live["a"] == ["1.a"]
+    assert core.config is new_config
+
+
+def test_try_hot_reload_declines_structural_changes_without_touching_xray(monkeypatch):
+    core = _Core(_config([_c("1.a")], port=443))
+    fake = FakeXray({"a": ["1.a"]})
+    _use_fake_xray(monkeypatch, fake)
+
+    assert hr.try_hot_reload(core, _config([_c("1.a")], port=8443)) is False
+    assert fake.calls == []
+
+
+def test_try_hot_reload_falls_back_when_the_apply_fails(monkeypatch):
+    core = _Core(_config([_c("1.a")]))
+    fake = FakeXray({"a": ["1.a"]})
+    fake.fail_adu = True
+    _use_fake_xray(monkeypatch, fake)
+
+    assert hr.try_hot_reload(core, _config([_c("1.a"), _c("2.b")])) is False
+
+
+def test_try_hot_reload_without_cli_support_still_no_ops_identical_configs(monkeypatch):
+    core = _Core(_config([_c("1.a")]))
+    monkeypatch.setattr(hr, "XRAY_HOT_RELOAD_ENABLED", True)
+    monkeypatch.setattr(hr, "_cli_supports_user_ops", lambda version: False)
+
+    assert hr.try_hot_reload(core, _config([_c("1.a")])) is True
+    assert hr.try_hot_reload(core, _config([_c("2.b")])) is False
+
+
+def test_sync_users_refuses_when_hot_ops_are_unavailable(monkeypatch):
+    core = _Core(_config([]))
+    monkeypatch.setattr(hr, "XRAY_HOT_RELOAD_ENABLED", False)
+
+    try:
+        hr.sync_users(core, {"a": []})
+    except hr.HotReloadUnavailable:
+        pass
+    else:
+        raise AssertionError("expected HotReloadUnavailable")
+
+
+def test_can_keep_core_requires_a_running_core_and_usable_hot_ops(monkeypatch):
+    core = _Core(_config([]))
+    monkeypatch.setattr(hr, "XRAY_HOT_RELOAD_ENABLED", True)
+    monkeypatch.setattr(hr, "_cli_supports_user_ops", lambda version: True)
+    assert hr.can_keep_core(core) is True
+
+    core.started = False
+    assert hr.can_keep_core(core) is False
+
+    core.started = True
+    monkeypatch.setattr(hr, "_cli_supports_user_ops", lambda version: False)
+    assert hr.can_keep_core(core) is False
+
+
+def test_unreconcilable_client_list_is_left_alone_when_unchanged(monkeypatch):
+    # A preconfigured client without an email can't be reconciled, but an
+    # unchanged inbound must not turn a hot reload into a full restart.
+    static = [{"id": "static-no-email"}]
+    core = _Core(_config(static, [_c("1.a")]))
+    fake = FakeXray({"a": [], "b": ["1.a"]})
+    _use_fake_xray(monkeypatch, fake)
+
+    assert hr.try_hot_reload(core, _config(static, [_c("1.a"), _c("2.b")])) is True
+    assert sorted(fake.live["b"]) == ["1.a", "2.b"]
+    assert fake.live["a"] == []
+
+
+def test_unreconcilable_client_list_that_changed_forces_a_full_restart(monkeypatch):
+    core = _Core(_config([{"id": "static-no-email"}]))
+    _use_fake_xray(monkeypatch, FakeXray({"a": []}))
+
+    assert hr.try_hot_reload(core, _config([{"id": "another-no-email"}])) is False
+
+
+def test_replacements_are_applied_in_small_remove_then_add_steps(monkeypatch):
+    # Untracked live users get re-pushed; doing it in small steps keeps the
+    # window in which they can't open new connections short.
+    emails = [f"{i}.u" for i in range(5)]
+    core = _Core(_config([]))
+    fake = FakeXray({"a": emails})
+    _use_fake_xray(monkeypatch, fake)
+    monkeypatch.setattr(hr, "_REPLACE_CHUNK", 2)
+
+    stats = hr.reconcile_users(core, {"a": [_c(e) for e in emails]})
+
+    assert fake.calls == ["inbounduser", "rmu", "adu", "rmu", "adu", "rmu", "adu"]
+    assert sorted(fake.live["a"]) == emails
+    assert (stats["added"], stats["removed"]) == (5, 5)
+
+
+def test_try_hot_reload_empties_an_inbound_whose_clients_key_disappeared(monkeypatch):
+    core = _Core(_config([_c("1.a")]))
+    fake = FakeXray({"a": ["1.a"]})
+    _use_fake_xray(monkeypatch, fake)
+    new_config = _config([])
+    del new_config["inbounds"][0]["settings"]["clients"]
+
+    assert hr.try_hot_reload(core, new_config) is True
+    assert fake.live["a"] == []
+
+
+# --- live credential verification and protocols `adu` can't add users to ---
+
+def test_live_account_matches_compares_what_xray_reports():
+    m = hr._live_account_matches
+    assert m({"_TypedMessage_": "x", "id": "ABC"}, {"id": "abc", "email": "1.a"}) is True
+    assert m({"id": "abc"}, {"id": "other"}) is False
+    assert m({"id": "abc", "flow": "xtls-rprx-vision"}, {"id": "abc", "flow": "xtls-rprx-vision"}) is True
+    assert m({"id": "abc"}, {"id": "abc", "flow": "xtls-rprx-vision"}) is False  # Xray omits an empty flow
+    assert m({"id": "abc", "flow": "xtls-rprx-vision"}, {"id": "abc"}) is False
+    assert m({"password": "p"}, {"password": "p"}) is True
+    assert m({"password": "p"}, {"password": "P"}) is False
+    assert m({"key": "k"}, {"password": "k"}) is True  # Shadowsocks 2022
+    assert m({"auth": "a"}, {"auth": "a"}) is True  # Hysteria
+    assert m({"auth": "a"}, {"password": "a"}) is False
+    assert m({"cipherType": "CHACHA20_POLY1305", "password": "p"},
+             {"method": "chacha20-ietf-poly1305", "password": "p"}) is True
+    assert m({"cipherType": "AES_256_GCM", "password": "p"}, {"method": "aes-128-gcm", "password": "p"}) is False
+    assert m({"id": "abc", "securitySettings": {"type": "AES128_GCM"}}, {"id": "abc"}) is True
+    # What a VLESS account pushed by the panel over gRPC looks like.
+    assert m({"encryption": "none", "id": "abc"}, {"id": "abc"}) is True
+    assert m({"encryption": "mlkem768x25519plus", "id": "abc"}, {"id": "abc"}) is None
+    assert m({}, {"id": "abc"}) is None
+    assert m({"id": "abc", "somethingNew": 1}, {"id": "abc"}) is None
+
+
+def test_untracked_live_user_with_the_wanted_credentials_is_left_alone(monkeypatch):
+    # Pushed by the panel over gRPC (so not in core.config), but Xray itself
+    # reports the wanted credentials: no remove/re-add, no connection gap.
+    core = _Core(_config([]))
+    fake = FakeXray({"a": ["1.a"]})
+    fake.accounts[("a", "1.a")] = {"_TypedMessage_": "xray.proxy.vless.Account", "id": "uuid-1.a"}
+    _use_fake_xray(monkeypatch, fake)
+
+    stats = hr.reconcile_users(core, {"a": [_c("1.a")]})
+
+    assert fake.calls == ["inbounduser"]
+    assert (stats["added"], stats["removed"], stats["unchanged"]) == (0, 0, 1)
+
+
+def test_tracked_user_whose_live_credentials_differ_is_replaced(monkeypatch):
+    # core.config agrees with the wanted entry, the live process does not.
+    core = _Core(_config([_c("1.a")]))
+    fake = FakeXray({"a": ["1.a"]})
+    fake.accounts[("a", "1.a")] = {"id": "stale-uuid"}
+    _use_fake_xray(monkeypatch, fake)
+
+    stats = hr.reconcile_users(core, {"a": [_c("1.a")]})
+
+    assert fake.calls == ["inbounduser", "rmu", "adu"]
+    assert (stats["added"], stats["removed"]) == (1, 1)
+
+
+def _hysteria_config(clients):
+    return {"inbounds": [{"tag": "hy", "protocol": "hysteria", "settings": {"version": 2, "clients": clients}}]}
+
+
+def test_inbound_adu_cannot_refill_only_ever_loses_users_it_should_not_have(monkeypatch):
+    core = _Core(_hysteria_config([]))
+    fake = FakeXray({"hy": ["1.a", "9.ghost"]})
+    fake.accounts[("hy", "1.a")] = {"auth": "pw-1"}
+    _use_fake_xray(monkeypatch, fake)
+
+    stats = hr.reconcile_users(core, {"hy": [{"email": "1.a", "auth": "pw-1"}]})
+
+    assert fake.live["hy"] == ["1.a"]
+    assert fake.calls == ["inbounduser", "rmu"]
+    assert (stats["removed"], stats["unchanged"]) == (1, 1)
+
+
+def test_nothing_is_removed_anywhere_when_such_an_inbound_would_need_an_add(monkeypatch):
+    # `adu` can't add Hysteria users. Failing only after the removals would
+    # leave users cut off until the caller's fallback reaches them.
+    config = _hysteria_config([])
+    config["inbounds"].insert(0, {"tag": "a", "protocol": "vless", "settings": {"clients": []}})
+    core = _Core(config)
+    fake = FakeXray({"a": ["9.ghost"], "hy": ["1.a"]})
+    fake.accounts[("hy", "1.a")] = {"auth": "stale"}
+    _use_fake_xray(monkeypatch, fake)
+
+    for wanted in ([{"email": "1.a", "auth": "pw-1"}],                      # replace needed
+                   [{"email": "1.a", "auth": "stale"}, {"email": "2.b", "auth": "x"}]):  # add needed
+        try:
+            hr.reconcile_users(core, {"a": [], "hy": wanted})
+        except hr.HotReloadError:
+            pass
+        else:
+            raise AssertionError("expected HotReloadError")
+        assert fake.live == {"a": ["9.ghost"], "hy": ["1.a"]}
+        assert "rmu" not in fake.calls and "adu" not in fake.calls
+
+
+def test_allow_pending_syncs_everything_else_and_reports_what_it_could_not_add(monkeypatch):
+    # The Hysteria inbound needs one user added and one replaced: with
+    # allow_pending neither blocks the vless inbound, both are reported, and
+    # the user to replace keeps its current account until the caller swaps it.
+    config = _hysteria_config([])
+    config["inbounds"].insert(0, {"tag": "a", "protocol": "vless", "settings": {"clients": []}})
+    core = _Core(config)
+    fake = FakeXray({"a": ["9.ghost"], "hy": ["1.a", "8.gone"]})
+    fake.accounts[("hy", "1.a")] = {"auth": "stale"}
+    _use_fake_xray(monkeypatch, fake)
+
+    stats = hr.reconcile_users(core, {
+        "a": [_c("2.b")],
+        "hy": [{"email": "1.a", "auth": "pw-1"}, {"email": "2.b", "auth": "pw-2"}],
+    }, allow_pending=True)
+
+    assert fake.live == {"a": ["2.b"], "hy": ["1.a"]}  # 8.gone removed, 1.a untouched
+    assert stats["pending_users"] == {"hy": ["1.a", "2.b"]}
+    assert (stats["added"], stats["removed"]) == (1, 2)
+
+
+def test_allow_pending_reports_nothing_when_such_an_inbound_is_in_sync(monkeypatch):
+    core = _Core(_hysteria_config([]))
+    fake = FakeXray({"hy": ["1.a"]})
+    fake.accounts[("hy", "1.a")] = {"auth": "pw-1"}
+    _use_fake_xray(monkeypatch, fake)
+
+    stats = hr.reconcile_users(core, {"hy": [{"email": "1.a", "auth": "pw-1"}]}, allow_pending=True)
+
+    assert stats["pending_users"] == {}
+    assert fake.calls == ["inbounduser"]
+
+
+def test_hot_reload_returns_pending_users_instead_of_demanding_a_restart(monkeypatch):
+    core = _Core(_hysteria_config([{"email": "1.a", "auth": "pw-1"}]))
+    fake = FakeXray({"hy": ["1.a"]})
+    fake.accounts[("hy", "1.a")] = {"auth": "pw-1"}
+    _use_fake_xray(monkeypatch, fake)
+    new_config = _hysteria_config([{"email": "1.a", "auth": "pw-1"}, {"email": "2.b", "auth": "pw-2"}])
+
+    assert hr.try_hot_reload(core, new_config) is False          # strict: full restart
+    stats = hr.hot_reload(core, new_config, allow_pending=True)  # asked: hot + pending
+    assert stats["pending_users"] == {"hy": ["2.b"]}
+    assert core.config is new_config
+
+
+def test_masque_password_is_verified_against_the_config_pass_field():
+    # MASQUE accounts carry `password`; inbound client entries call it `pass`.
+    m = hr._live_account_matches
+    assert m({"password": "p"}, {"pass": "p", "email": "1.a"}) is True
+    assert m({"password": "p"}, {"pass": "other"}) is False
+
+
+# --- listing failures and policy levels ---
+
+def test_failed_listing_is_never_mistaken_for_an_inbound_without_users(monkeypatch):
+    # Xray unreachable / timed out: the live state is unknown. Even with an
+    # unchanged client list this must fail (the caller retries or falls
+    # back) instead of reporting a sync that never looked at anything.
+    for error in ("xray api inbounduser failed: failed to dial 127.0.0.1:62052",
+                  "xray api inbounduser timed out"):
+        core = _Core(_config([_c("1.a")]))
+        fake = FakeXray({"a": ["1.a", "9.ghost"]})
+        fake.listing_error = error
+        _use_fake_xray(monkeypatch, fake)
+
+        try:
+            hr.reconcile_users(core, {"a": [_c("1.a")]})
+        except hr.NotUserManageable:
+            raise AssertionError("an operational failure must not look like 'no users here'")
+        except hr.HotReloadError:
+            pass
+        else:
+            raise AssertionError("expected HotReloadError")
+        assert hr.try_hot_reload(core, _config([_c("1.a")])) is False
+
+
+def test_unparsable_listing_fails_the_call(monkeypatch):
+    core = _Core(_config([_c("1.a")]))
+    monkeypatch.setattr(hr, "_run_xray_api", lambda args, payload=None, timeout=3: "not json")
+    monkeypatch.setattr(hr, "_cli_supports_user_ops", lambda version: True)
+
+    try:
+        hr.reconcile_users(core, {"a": [_c("1.a")]})
+    except hr.HotReloadError:
+        pass
+    else:
+        raise AssertionError("expected HotReloadError")
+
+
+def test_user_whose_only_change_is_its_level_is_replaced(monkeypatch):
+    for live_level, wanted_level in ((0, 3), (3, 0), (3, 5)):
+        tracked = dict(_c("1.a"), **({"level": live_level} if live_level else {}))
+        wanted = dict(_c("1.a"), **({"level": wanted_level} if wanted_level else {}))
+        core = _Core(_config([tracked]))
+        fake = FakeXray({"a": ["1.a"]})
+        fake.accounts[("a", "1.a")] = {"id": "uuid-1.a"}
+        fake.levels[("a", "1.a")] = live_level
+        _use_fake_xray(monkeypatch, fake)
+
+        stats = hr.reconcile_users(core, {"a": [wanted]})
+
+        assert fake.calls == ["inbounduser", "rmu", "adu"], (live_level, wanted_level)
+        assert (stats["added"], stats["removed"]) == (1, 1)
+
+
+def test_user_with_the_wanted_level_is_left_alone(monkeypatch):
+    core = _Core(_config([]))
+    fake = FakeXray({"a": ["1.a"]})
+    fake.accounts[("a", "1.a")] = {"id": "uuid-1.a"}
+    fake.levels[("a", "1.a")] = 3
+    _use_fake_xray(monkeypatch, fake)
+
+    stats = hr.reconcile_users(core, {"a": [dict(_c("1.a"), level=3)]})
+
+    assert fake.calls == ["inbounduser"]
+    assert stats["unchanged"] == 1

@@ -93,5 +93,50 @@ of the whole feature set `NODE_REMOTE_UPDATE_ENABLED: "false"` (and/or run
 triggers, only expose this on nodes that authenticate the panel with
 `SSL_CLIENT_CERT_FILE`.
 
+## Keeping user connections across panel restarts
+
+A user add/remove never needs an Xray restart, and neither does the panel
+reconnecting. This needs `XRAY_HOT_RELOAD_ENABLED` (on by default) and an
+Xray binary >= v25.7.26 (the first with `xray api adu`/`rmu`/`inbounduser`);
+without either, everything below quietly falls back to the old full-restart
+behaviour.
+
+- **Session takeover.** `POST /connect` with `keep_core: true` hands a new
+  session the Xray process that is already running instead of stopping it,
+  as long as the request comes from the same address as the previous
+  session. The panel then sends its current config with `/restart`. A
+  `/connect` without the field (an older panel) stops the core as before.
+- **Hot reload reconciles against the live process.** `/restart` with a
+  config that differs from the running one only in its `clients` lists does
+  not restart anything: the node reads the users Xray actually has
+  (`api inbounduser`), removes the ones the config doesn't list, adds the
+  missing ones, and replaces a user only when the credentials Xray reports
+  for it differ from the wanted ones. It used to diff against the config it
+  was last started with, which is stale as soon as the panel adds or
+  removes a user through Xray's gRPC API directly.
+  `xray api adu` can only add users to vless/vmess/trojan/shadowsocks
+  inbounds. On any other inbound (Hysteria, MASQUE) users are verified and
+  removed hot, but can't be added or replaced here. A caller that sends
+  `allow_pending: true` (with `/restart` or `/sync-users`) gets everything
+  else synced and those users back as `pending_users: {inbound tag:
+  [email, ...]}`, untouched, to push itself over Xray's gRPC API — which is
+  what the panel does. Without the flag such a config is refused before
+  anything is touched: `/restart` does a full restart, `/sync-users`
+  answers `500`.
+- **`POST /sync-users`** (`session_id`, `clients: {inbound tag: [client,
+  ...]}`) does only that reconciliation and never restarts or stops the
+  core: `501` if hot user operations are unavailable on this node, `503`
+  if the core isn't running, `500` if applying failed. The response carries
+  `added`, `removed`, `unchanged` and `skipped_tags` (inbounds the running
+  config doesn't have).
+- **`/ping`** answers with the same status as `/`, and every status response
+  lists the optional protocol `features` this build supports (`keep-core`,
+  `ping-status`, `gzip`, `sync-users`), so a panel can use each one only on
+  nodes that have it. Request bodies may be sent with
+  `Content-Encoding: gzip`.
+
+`tests/test_real_xray_integration.py` runs all of this against a real Xray
+process when `XRAY_REAL_BINARY` points at one (it is skipped otherwise).
+
 ## Manual install
 Read the setup guide here: https://gozargah.github.io/marzban/docs/marzban-node

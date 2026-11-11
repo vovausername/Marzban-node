@@ -2,15 +2,18 @@
 
 A full core restart drops every active user connection, but the panel's
 restart calls are almost always just "a user was added/removed/changed".
-This module diffs the incoming config against the one currently running:
-if they are identical it's a no-op, and if the ONLY difference is the
-"clients" lists inside inbound settings, the delta is applied to the live
-process through Xray's HandlerService. Anything else — or any error on
-this hot path — makes the caller fall back to the plain full restart, so
-the node can never keep running a config the panel didn't send.
+This module compares the incoming config with the one currently running:
+if they differ ONLY in the "clients" lists inside inbound settings (or not
+at all), the wanted client lists are reconciled against the users the live
+process actually has, through Xray's HandlerService. Anything else — or
+any error on this hot path — makes the caller fall back to the plain full
+restart, so the node can never keep running a config the panel didn't send.
+sync_users() exposes the same reconciliation on its own, for a panel that
+only wants a node's users brought up to date.
 
 No grpcio dependency: HandlerService is driven through the xray binary's
-own `api adu` / `api rmu` subcommands (available since Xray v25.7.26)
+own `api adu` / `api rmu` / `api inbounduser` subcommands (all present
+since Xray v25.7.26)
 against the loopback plaintext API inbound that xray.py injects — the CLI
 only speaks plaintext gRPC, so it can't use the panel's TLS API inbound.
 """
@@ -34,6 +37,26 @@ _TOTAL_RE = re.compile(r"(?:Added|Removed) (\d+) user\(s\) in total\.")
 # failure.
 _NOT_FOUND_RE = re.compile(r"User (\S+) not found", re.IGNORECASE)
 
+# `adu`'s per-user error for an email the live process already has — see
+# _expect_added.
+_ALREADY_EXISTS_RE = re.compile(r"User (\S+) already exists", re.IGNORECASE)
+
+# Emails per `rmu` call: they travel as argv, so an unbounded list can hit
+# the kernel's argument-size limit on a big removal.
+_RMU_CHUNK = 2000
+
+# Clients per `adu` call (summed over the inbounds in its payload).
+_ADU_CHUNK = 20000
+
+# Users per remove-then-re-add step, see reconcile_users().
+_REPLACE_CHUNK = 500
+
+# Inbound protocols whose users `xray api adu` can add. For anything else
+# (e.g. hysteria) the CLI answers "unsupported inbound type" and adds
+# nothing, although `rmu` and `inbounduser` work — so on such an inbound
+# users can be listed and removed here, but never (re-)added.
+_ADU_PROTOCOLS = frozenset({"vless", "vmess", "trojan", "shadowsocks"})
+
 # One synchronization boundary around every mutation of the live core:
 # connect/disconnect/start/stop/restart, hot-reload's diff against
 # core.config, and the core.config assignment that follows any of them.
@@ -55,7 +78,20 @@ class HotReloadError(Exception):
     pass
 
 
+class NotUserManageable(HotReloadError):
+    """Xray has the inbound, but its protocol has no users to list or
+    change — as opposed to failing to ask Xray at all."""
+
+
+class HotReloadUnavailable(HotReloadError):
+    """User hot-ops can't be used on this node right now (feature off, old
+    Xray binary, core not running) — as opposed to a failed apply."""
+
+
 def _cli_supports_user_ops(version) -> bool:
+    """Whether this xray binary's CLI has `api adu`/`rmu` (add/remove users)
+    and `api inbounduser` (list an inbound's live users) — everything
+    reconcile_users() needs."""
     cached = _cli_probe_cache.get(version)
     if cached is not None:
         return cached
@@ -65,7 +101,8 @@ def _cli_supports_user_ops(version) -> bool:
             [XRAY_EXECUTABLE_PATH, "help", "api"],
             stderr=subprocess.STDOUT, timeout=10
         ).decode()
-        supported = bool(re.search(r"\badu\b", output) and re.search(r"\brmu\b", output))
+        supported = bool(re.search(r"\badu\b", output) and re.search(r"\brmu\b", output)
+                         and re.search(r"\binbounduser\b", output))
     except Exception:
         supported = False
 
@@ -75,17 +112,34 @@ def _cli_supports_user_ops(version) -> bool:
 
 
 def _strip_clients(config: dict) -> tuple:
-    """Deep-copy `config` with every inbound's settings.clients removed;
-    return (stripped_config, {inbound_tag: clients_list})."""
-    stripped = json.loads(json.dumps(config))
+    """Return (config_without_clients, {inbound_tag: clients_list}).
+
+    Nothing is deep-copied: the result shares every nested object with
+    `config` except the inbound and settings dicts that had to lose their
+    "clients" key, so it is only good for reading/serializing. A config
+    carries every user of every inbound — copying and re-serializing all of
+    that just to compare the (small) rest of the config was most of the
+    cost of a hot reload."""
+    stripped = dict(config)
+    inbounds = []
     clients_by_tag = {}
-    for inbound in stripped.get("inbounds", []):
-        settings = inbound.get("settings")
+    for inbound in config.get("inbounds", []):
+        settings = inbound.get("settings") if isinstance(inbound, dict) else None
         if isinstance(settings, dict):
-            clients_by_tag[inbound.get("tag")] = settings.pop("clients", [])
-        else:
+            clients_by_tag[inbound.get("tag")] = settings.get("clients", [])
+            if "clients" in settings:
+                inbound = dict(inbound)
+                inbound["settings"] = {k: v for k, v in settings.items() if k != "clients"}
+        elif isinstance(inbound, dict):
             clients_by_tag[inbound.get("tag")] = []
+        inbounds.append(inbound)
+    if "inbounds" in config:
+        stripped["inbounds"] = inbounds
     return stripped, clients_by_tag
+
+
+def _same_structure(old_stripped: dict, new_stripped: dict) -> bool:
+    return json.dumps(old_stripped, sort_keys=True) == json.dumps(new_stripped, sort_keys=True)
 
 
 def _clients_by_email(clients: list):
@@ -112,7 +166,7 @@ def compute_client_delta(old_config: dict, new_config: dict):
     old_stripped, old_clients = _strip_clients(old_config)
     new_stripped, new_clients = _strip_clients(new_config)
 
-    if json.dumps(old_stripped, sort_keys=True) != json.dumps(new_stripped, sort_keys=True):
+    if not _same_structure(old_stripped, new_stripped):
         return None
 
     added = {}
@@ -120,7 +174,7 @@ def compute_client_delta(old_config: dict, new_config: dict):
     # Tag sets are equal here: tags live in the stripped copies just compared.
     for tag, new_list in new_clients.items():
         old_list = old_clients.get(tag, [])
-        if json.dumps(old_list, sort_keys=True) == json.dumps(new_list, sort_keys=True):
+        if old_list == new_list:
             continue
 
         old_map = _clients_by_email(old_list)
@@ -132,8 +186,7 @@ def compute_client_delta(old_config: dict, new_config: dict):
         tag_added = [client for email, client in new_map.items() if email not in old_map]
         for email, client in new_map.items():
             old_client = old_map.get(email)
-            if old_client is not None and \
-                    json.dumps(old_client, sort_keys=True) != json.dumps(client, sort_keys=True):
+            if old_client is not None and old_client != client:
                 tag_removed.append(email)
                 tag_added.append(client)
 
@@ -264,144 +317,504 @@ def _expect_total(stdout: str, expected: int, operation: str) -> None:
     if not m or int(m.group(1)) != expected:
         raise HotReloadError(
             f"xray api {operation} applied {m.group(1) if m else 'unknown'} "
-            f"of {expected} user(s): {stdout.strip()}"
+            f"of {expected} user(s): {stdout.strip()[-2000:]}"
         )
+
+
+def _reported_emails(pattern, stdout: str, emails: list) -> int:
+    """How many of `pattern`'s per-user lines in `stdout` are about one of
+    `emails` (compared case-insensitively: Xray lowercases emails)."""
+    wanted = {str(email).lower() for email in emails}
+    return sum(1 for email in pattern.findall(stdout) if email.rstrip(".").lower() in wanted)
 
 
 def _expect_removed(stdout: str, emails: list, tag: str) -> None:
     """rmu prints per-user errors but exits 0; a user reported "not found"
     is treated as success rather than a hard failure — the desired end
     state (user gone from this inbound) is already true. This happens
-    routinely when an earlier hot-reload attempt removed the same users
-    live but then failed on a *later* tag before core.config could be
-    updated to match (see the progressive core.config sync in
-    apply_delta): the next attempt recomputes the identical "remove these"
-    delta against a live process that's already caught up. Any other
-    failure (Xray unreachable, malformed email, ...) still raises."""
+    routinely: the panel also removes users straight through Xray's gRPC
+    API, so the live process can be ahead of anything this node tracked.
+    Any other failure (Xray unreachable, malformed email, ...) still
+    raises."""
     m = _TOTAL_RE.search(stdout)
     removed_count = int(m.group(1)) if m else 0
-    not_found = set(_NOT_FOUND_RE.findall(stdout)) & set(emails)
-    if removed_count + len(not_found) < len(emails):
+    not_found = _reported_emails(_NOT_FOUND_RE, stdout, emails)
+    if removed_count + not_found < len(emails):
         raise HotReloadError(
             f"xray api rmu applied {removed_count} of {len(emails)} user(s) "
-            f"on inbound {tag!r}: {stdout.strip()}"
+            f"on inbound {tag!r}: {stdout.strip()[-2000:]}"
         )
 
 
-def _record_user_delta(core, tag: str, removed_emails=None, added_clients=None) -> None:
-    """Update core.config's inbound `tag` client list to reflect a
-    successful adu/rmu call — the per-user equivalent of
-    _record_added_entry/_record_removed_entry, applied incrementally as
-    apply_delta works through each tag rather than only once at the very
-    end. Without this, a later tag's rmu/adu failing mid apply_delta would
-    leave core.config believing this tag's already-successful change never
-    happened: the next hot-reload attempt would recompute the exact same
-    delta for this tag and hit spurious "already removed"/"already exists"
-    responses against the live process instead of a no-op."""
+def _expect_added(stdout: str, emails: list) -> None:
+    """adu's counterpart of _expect_removed: a user reported "already
+    exists" is treated as success. reconcile_users() only adds emails the
+    live process didn't have a moment earlier, so this can only be the
+    panel adding the very same user through Xray's gRPC API in between —
+    and what the panel pushes directly is at least as fresh as the list
+    this sync was built from. Before this was tolerated, one such user
+    turned every hot reload into a full restart that dropped all
+    connections."""
+    m = _TOTAL_RE.search(stdout)
+    added_count = int(m.group(1)) if m else 0
+    exists = _reported_emails(_ALREADY_EXISTS_RE, stdout, emails)
+    if added_count + exists < len(emails):
+        raise HotReloadError(
+            f"xray api adu applied {added_count} of {len(emails)} user(s): "
+            f"{stdout.strip()[-2000:]}"
+        )
+
+
+def _bulk_timeout(operations: int) -> int:
+    """`-timeout` for a CLI call making `operations` loopback RPCs. Xray
+    handles several thousand of them per second; this leaves a wide margin
+    and still bounds a hung process."""
+    return max(10, 5 + operations // 500)
+
+
+def _lowercase_map(clients: list):
+    """{lowercased email: client}; None if a client has no email or two
+    clients collide — such a list can't be reconciled reliably."""
+    by_email = {}
+    for client in clients:
+        email = client.get("email") if isinstance(client, dict) else None
+        if not email or not isinstance(email, str) or email.lower() in by_email:
+            return None
+        by_email[email.lower()] = client
+    return by_email
+
+
+def _list_live_users(tag: str) -> dict:
+    """{lowercased email: [(email, account, level), ...]} for every user
+    Xray currently has on inbound `tag`: the email as the live process
+    reports it, the account it holds (credentials as Xray prints them) and
+    its policy level. One list entry per occurrence — a classic Shadowsocks
+    inbound accepts the same email more than once.
+
+    Raises NotUserManageable when the inbound's protocol has no users, and
+    plain HotReloadError for everything else (Xray unreachable, timeout,
+    unknown tag, unparsable answer): only the former says anything about
+    the inbound, the rest means the live state is simply unknown."""
+    try:
+        output = _run_xray_api(["inbounduser", f"-tag={tag}"], timeout=30)
+    except HotReloadError as exc:
+        if "not a usermanager" in str(exc).lower():
+            raise NotUserManageable(str(exc))
+        raise
+    try:
+        users = (json.loads(output) if output.strip() else {}).get("users") or []
+    except (ValueError, AttributeError):
+        raise HotReloadError(f"xray api inbounduser returned unparsable output for inbound {tag!r}")
+    live = {}
+    for user in users:
+        email = user.get("email") if isinstance(user, dict) else None
+        if email:
+            account = user.get("account")
+            live.setdefault(email.lower(), []).append(
+                (email, account if isinstance(account, dict) else {}, user.get("level") or 0))
+    return live
+
+
+def _list_live_emails(tag: str) -> dict:
+    """{lowercased email: [email, ...]} — _list_live_users() without accounts."""
+    return {key: [entry[0] for entry in entries] for key, entries in _list_live_users(tag).items()}
+
+
+def _same_level(live_level, client: dict) -> bool:
+    """Whether the live user's policy level is the one the client entry
+    asks for (Xray omits level 0 from its listing, configs usually too)."""
+    try:
+        return int(live_level or 0) == int(client.get("level") or 0)
+    except (TypeError, ValueError):
+        return False
+
+
+def _cipher_name(value) -> str:
+    """Shadowsocks cipher spelled the same whether it comes from a config
+    ("chacha20-ietf-poly1305") or from Xray's listing ("CHACHA20_POLY1305")."""
+    return re.sub(r"[^A-Z0-9]", "", str(value).upper()).replace("IETF", "")
+
+
+_CREDENTIAL_NAMES = {
+    "id": ("id",),
+    "password": ("password", "pass"),
+    "auth": ("auth",),
+    "key": ("password",),
+}
+
+
+def _live_account_matches(account: dict, client: dict):
+    """Whether the live `account` of a user (as `api inbounduser` prints it)
+    carries the credentials of the wanted config `client`.
+
+    True: every field Xray reports equals the client's. False: one differs.
+    None: can't tell — Xray reported no credential at all, or a field this
+    doesn't know how to compare.
+    """
+    verified = False
+    for key, value in account.items():
+        if key == "_TypedMessage_":
+            continue
+        if key in ("id", "password", "auth", "key"):
+            # The same credential under the names configs use for it:
+            # Shadowsocks 2022 reports the user's key (config: password),
+            # MASQUE reports password (config: pass).
+            wanted = next((client[name] for name in _CREDENTIAL_NAMES[key] if client.get(name) is not None), None)
+            if wanted is None:
+                return False
+            wanted, value = str(wanted), str(value)
+            if key == "id":  # UUIDs compare case-insensitively
+                wanted, value = wanted.lower(), value.lower()
+            if wanted != value:
+                return False
+            verified = True
+        elif key == "flow":
+            pass  # compared below, also when Xray omits it
+        elif key == "cipherType":
+            if "method" in client and _cipher_name(client["method"]) != _cipher_name(value):
+                return False
+        elif key == "encryption":
+            # VLESS accounts the panel pushes over gRPC carry
+            # encryption "none"; inbound client entries never set it.
+            if str(value or "none") != str(client.get("encryption") or "none"):
+                return None
+        elif key == "securitySettings":
+            if "security" in client:
+                return None
+        else:
+            return None
+    if (account.get("flow") or "") != (client.get("flow") or ""):
+        return False
+    return True if verified else None
+
+
+def _set_tracked_clients(core, tag: str, clients: list) -> None:
+    """Point core.config's inbound `tag` at `clients`, keeping the tracked
+    config in step with what was just applied to the live process."""
     config = getattr(core, "config", None)
     if config is None:
         return
     for inbound in config.get("inbounds", []):
-        if inbound.get("tag") != tag:
-            continue
-        settings = inbound.get("settings")
-        if not isinstance(settings, dict):
+        if inbound.get("tag") == tag and isinstance(inbound.get("settings"), dict):
+            inbound["settings"]["clients"] = clients
             return
-        clients = settings.get("clients")
+
+
+def reconcile_users(core, desired_by_tag: dict, inbound_defs: dict = None,
+                    allow_pending: bool = False) -> dict:
+    """Make the live process hold exactly `desired_by_tag[tag]` on each
+    listed inbound, without restarting it.
+
+    The live user list is read back from Xray itself (`api inbounduser`)
+    instead of being assumed equal to core.config: the panel also adds and
+    removes users directly through Xray's gRPC API, which this node never
+    sees, so core.config drifts from the running process within minutes.
+    Diffing against that stale copy both missed real differences and
+    reported phantom ones.
+
+    Per inbound: users the process has but the list doesn't are removed;
+    users the list has but the process doesn't are added; a user present
+    on both sides is left alone when the credentials Xray reports for it
+    are the wanted ones (or, where Xray reports none, when core.config
+    already tracks exactly the wanted entry), and is removed + re-added
+    otherwise. Duplicate live entries for one email are collapsed the same
+    way. On an inbound whose protocol `xray api adu` can't add users to
+    (see _ADU_PROTOCOLS) users are only ever removed. The users such an
+    inbound would need added or replaced are left exactly as they are and
+    returned as "pending_users" when `allow_pending` is set — the caller
+    promises to push those itself (the panel can, over Xray's gRPC API);
+    without it the whole call fails before touching anything.
+
+    `inbound_defs` supplies the inbound definitions to build `adu` payloads
+    from (the CLI needs a complete inbound); core.config's own are used
+    when omitted. Tags the running config doesn't have are skipped and
+    reported. An inbound that can't be reconciled (not user-manageable, or
+    a client list with a missing/repeated email) is skipped when its client
+    list is the one already tracked, and fails the call otherwise.
+
+    Returns {"added", "removed", "unchanged", "skipped_tags",
+    "pending_users": {tag: [email, ...]}}. Raises
+    HotReloadError on any failure; core.config then reflects the removals
+    already applied, and the next call re-reads the live state anyway.
+    """
+    config = getattr(core, "config", None) or {}
+    running = {
+        inbound.get("tag"): inbound
+        for inbound in config.get("inbounds", []) if isinstance(inbound, dict)
+    }
+    inbound_defs = inbound_defs or {}
+
+    # (tag, wanted clients, emails to drop, [(live emails, client)] to
+    # replace, clients to add)
+    plans = []
+    skipped_tags = []
+    pending_users = {}
+    unchanged = 0
+    for tag, clients in desired_by_tag.items():
+        inbound = running.get(tag)
+        if inbound is None or tag in _PROTECTED_INBOUND_TAGS:
+            skipped_tags.append(tag)
+            continue
         if not isinstance(clients, list):
-            return
-        if removed_emails:
-            clients[:] = [c for c in clients if c.get("email") not in removed_emails]
-        if added_clients:
-            clients.extend(json.loads(json.dumps(added_clients)))
-        return
+            raise HotReloadError(f"clients of inbound {tag!r} must be a list")
+
+        settings = inbound.get("settings")
+        tracked_list = settings.get("clients") if isinstance(settings, dict) else None
+        tracked = _lowercase_map(tracked_list) if isinstance(tracked_list, list) else None
+        untouched = (tracked_list or []) == clients
+
+        # An inbound this can't reconcile — a client without an email, a
+        # repeated email, or a protocol that has no users in Xray — is
+        # left alone as long as its client list is the one already tracked
+        # (nothing was asked to change on it), and fails the call otherwise.
+        # A listing that failed for any other reason (Xray unreachable,
+        # timeout, garbage) always fails the call: the live state is
+        # unknown then, and reporting success would hide exactly the drift
+        # this exists to repair.
+        desired = _lowercase_map(clients)
+        if desired is None:
+            if untouched:
+                continue
+            raise HotReloadError(f"inbound {tag!r} has a client without an email or a repeated email")
+        try:
+            live = _list_live_users(tag)
+        except NotUserManageable:
+            if untouched:
+                continue
+            raise
+
+        to_drop = []
+        to_replace = []
+        for email, entries in live.items():
+            occurrences = [entry[0] for entry in entries]
+            wanted = desired.get(email)
+            if wanted is None:
+                to_drop.extend(occurrences)
+                continue
+            # Trust what the process itself reports about the user's
+            # credentials; only when that says nothing fall back to "the
+            # tracked config already has exactly this entry".
+            matches = _live_account_matches(entries[0][1], wanted) if len(entries) == 1 else False
+            if matches is None:
+                matches = tracked is not None and tracked.get(email) == wanted
+            # The level lives on the user, not in the account: same
+            # credentials under another policy level is still a change.
+            if matches and not _same_level(entries[0][2], wanted):
+                matches = False
+            if matches:
+                unchanged += 1
+            else:
+                to_replace.append((occurrences, wanted))
+        to_add = [client for email, client in desired.items() if email not in live]
+
+        if (to_add or to_replace) and inbound.get("protocol") not in _ADU_PROTOCOLS:
+            if not allow_pending:
+                # Decided here, before anything is removed anywhere: removing
+                # a user this can't add back would cut them off until the
+                # caller's fallback (full restart / per-user sync) gets to them.
+                raise HotReloadError(
+                    f"inbound {tag!r} ({inbound.get('protocol')}) needs users added, "
+                    "which `xray api adu` can't do for this protocol"
+                )
+            # Hand them to the caller untouched: a user to replace keeps its
+            # current account until the caller swaps it.
+            pending_users[tag] = (
+                [client["email"] for _occurrences, client in to_replace]
+                + [client["email"] for client in to_add]
+            )
+            to_replace, to_add = [], []
+        plans.append((tag, clients, to_drop, to_replace, to_add))
+
+    def _rmu(tag, emails):
+        for start in range(0, len(emails), _RMU_CHUNK):
+            chunk = emails[start:start + _RMU_CHUNK]
+            output = _run_xray_api(["rmu", f"-tag={tag}", *chunk], timeout=_bulk_timeout(len(chunk)))
+            _expect_removed(output, chunk, tag)
+        gone = {email.lower() for email in emails}
+        tracked_list = (running[tag].get("settings") or {}).get("clients")
+        if gone and isinstance(tracked_list, list):
+            _set_tracked_clients(core, tag, [
+                client for client in tracked_list
+                if not (isinstance(client, dict) and str(client.get("email", "")).lower() in gone)
+            ])
+
+    # `adu` over stdin. Each payload inbound must be a complete valid
+    # inbound (the CLI Build()s it before extracting users), so ship the
+    # inbound definition with only the clients to add inside.
+    def _adu(batch):
+        emails = [client["email"] for inbound in batch for client in inbound["settings"]["clients"]]
+        output = _run_xray_api(["adu", "stdin:"], payload=json.dumps({"inbounds": batch}),
+                               timeout=_bulk_timeout(len(emails)))
+        _expect_added(output, emails)
+
+    def _payload_inbound(tag, clients):
+        definition = inbound_defs.get(tag) or running[tag]
+        inbound = dict(definition)
+        inbound["settings"] = dict(definition.get("settings") or {})
+        inbound["settings"]["clients"] = clients
+        return inbound
+
+    removed = added = 0
+    for tag, _clients, to_drop, to_replace, _to_add in plans:
+        if to_drop:
+            _rmu(tag, to_drop)
+            removed += len(to_drop)
+        # Replacements go in small remove-then-add steps: between the two
+        # calls those users can't open new connections (established ones
+        # are unaffected), so the fewer users per step the shorter that is.
+        for start in range(0, len(to_replace), _REPLACE_CHUNK):
+            chunk = to_replace[start:start + _REPLACE_CHUNK]
+            emails = [email for occurrences, _client in chunk for email in occurrences]
+            _rmu(tag, emails)
+            removed += len(emails)
+            _adu([_payload_inbound(tag, [client for _occurrences, client in chunk])])
+            added += len(chunk)
+
+    batch, batch_size = [], 0
+    for tag, _clients, _to_drop, _to_replace, to_add in plans:
+        for start in range(0, len(to_add), _ADU_CHUNK):
+            chunk = to_add[start:start + _ADU_CHUNK]
+            if batch and batch_size + len(chunk) > _ADU_CHUNK:
+                _adu(batch)
+                added += batch_size
+                batch, batch_size = [], 0
+            batch.append(_payload_inbound(tag, chunk))
+            batch_size += len(chunk)
+    if batch:
+        _adu(batch)
+        added += batch_size
+
+    for tag, clients, _to_drop, _to_replace, _to_add in plans:
+        _set_tracked_clients(core, tag, json.loads(json.dumps(clients)))
+
+    return {"added": added, "removed": removed, "unchanged": unchanged,
+            "skipped_tags": skipped_tags, "pending_users": pending_users}
 
 
-def apply_delta(core, new_config: dict, delta: dict) -> None:
-    # Removals first: a changed user's old credentials must be gone before
-    # `adu` re-adds them — it errors on a duplicate email.
-    for tag, emails in delta["removed"].items():
-        output = _run_xray_api(["rmu", f"-tag={tag}", *emails])
-        _expect_removed(output, emails, tag)
-        # The full requested set is confirmed gone either way (freshly
-        # removed or already absent) — see _expect_removed.
-        _record_user_delta(core, tag, removed_emails=set(emails))
+def _user_ops_available(core) -> bool:
+    return bool(
+        XRAY_HOT_RELOAD_ENABLED
+        and getattr(core, "config", None) is not None
+        and _cli_supports_user_ops(getattr(core, "version", None))
+    )
 
-    if not delta["added"]:
-        return
 
-    # One `adu` call over stdin. Each payload inbound must be a complete
-    # valid inbound (the CLI Build()s it before extracting users), so ship
-    # full copies from the new config with only the added clients inside.
-    payload_inbounds = []
-    total_added = 0
-    for inbound in new_config.get("inbounds", []):
-        clients = delta["added"].get(inbound.get("tag"))
-        if not clients:
-            continue
-        inbound_copy = json.loads(json.dumps(inbound))
-        inbound_copy["settings"]["clients"] = clients
-        payload_inbounds.append(inbound_copy)
-        total_added += len(clients)
+def can_keep_core(core) -> bool:
+    """Whether a new control session may take over the already-running
+    process instead of stopping it: only when the caller can then bring it
+    to its own config without a restart (see try_hot_reload)."""
+    with core_lock:
+        return bool(core.started and _user_ops_available(core))
 
-    output = _run_xray_api(["adu", "stdin:"],
-                           payload=json.dumps({"inbounds": payload_inbounds}))
-    _expect_total(output, total_added, "adu")
-    for inbound in payload_inbounds:
-        _record_user_delta(core, inbound["tag"], added_clients=inbound["settings"]["clients"])
+
+def _pending_note(stats: dict) -> str:
+    pending = sum(len(emails) for emails in stats.get("pending_users", {}).values())
+    return f", {pending} left to the panel on {', '.join(map(str, stats['pending_users']))}" if pending else ""
+
+
+def sync_users(core, clients_by_tag: dict, allow_pending: bool = False) -> dict:
+    """Bring the running process's users to `clients_by_tag` ({inbound tag:
+    [client, ...]}, the same client entries a start config carries) — the
+    panel's "resync this node" in one call instead of several gRPC calls
+    per user. Never restarts or stops the core: raises HotReloadUnavailable
+    when user hot-ops can't be used here (the caller falls back to its own
+    per-user path) and HotReloadError on a failed apply. See
+    reconcile_users() for the semantics and the returned counters."""
+    with core_lock:
+        if not core.started:
+            raise HotReloadUnavailable("Xray has not been started")
+        if not _user_ops_available(core):
+            raise HotReloadUnavailable(
+                "user hot-ops are unavailable (XRAY_HOT_RELOAD_ENABLED is off, "
+                "or this Xray lacks `api adu`/`rmu`/`inbounduser`)"
+            )
+        stats = reconcile_users(core, clients_by_tag, allow_pending=allow_pending)
+        logger.info(
+            f"Synced users without restart: +{stats['added']} -{stats['removed']} "
+            f"={stats['unchanged']}" + _pending_note(stats)
+            + (f", unknown inbound(s) skipped: {', '.join(map(str, stats['skipped_tags']))}"
+               if stats["skipped_tags"] else "")
+        )
+        return stats
 
 
 def try_hot_reload(core, new_config: dict) -> bool:
+    """hot_reload() as a yes/no: True when `new_config` is fully in effect
+    without a restart, False when the caller must do the full restart."""
+    return hot_reload(core, new_config) is not None
+
+
+def hot_reload(core, new_config: dict, allow_pending: bool = False):
     """Try to bring the running core to `new_config` without restarting it.
 
-    True means the config is now in effect and core.config has been
-    updated — the caller reports success without touching the process
-    (users were hot-applied, or the config was already up to date). False
-    means the caller must do the normal full restart — including after any
-    hot-path error, since the full restart re-applies the complete new
-    config and therefore re-syncs the live state no matter how far the hot
-    path got. Callers should hold core_lock across this call AND their
-    fallback restart + core.config assignment, so overlapping restart
-    requests can't diff against a core.config another thread is still
-    updating.
+    Returns the reconcile counters (see reconcile_users) when the config is
+    now in effect and core.config has been updated — the caller reports
+    success without touching the process (users were reconciled against the
+    live process, or nothing needed changing). With `allow_pending`, users
+    this could not add (see reconcile_users) are listed under
+    "pending_users" for the caller to push. Returns None when the caller
+    must do the normal full restart — including after any hot-path error,
+    since the full restart re-applies the complete new config and therefore
+    re-syncs the live state no matter how far the hot path got. Callers
+    should hold core_lock across this call AND their fallback restart +
+    core.config assignment, so overlapping restart requests can't diff
+    against a core.config another thread is still updating.
     """
     with core_lock:
         if not XRAY_HOT_RELOAD_ENABLED:
-            return False
+            return None
         if not core.started:
-            return False
+            return None
         old_config = getattr(core, "config", None)
         if old_config is None:
-            return False
+            return None
 
-        delta = compute_client_delta(old_config, new_config)
-        if delta is None:
-            return False
+        old_stripped, old_clients = _strip_clients(old_config)
+        new_stripped, new_clients = _strip_clients(new_config)
+        if not _same_structure(old_stripped, new_stripped):
+            return None
 
-        if not delta["added"] and not delta["removed"]:
-            logger.info("Config unchanged, skipping Xray restart")
-            core.config = new_config
-            return True
-
-        if not _cli_supports_user_ops(core.version):
+        if not _cli_supports_user_ops(getattr(core, "version", None)):
+            if old_clients == new_clients:
+                logger.info("Config unchanged, skipping Xray restart")
+                core.config = new_config
+                return {"added": 0, "removed": 0, "unchanged": 0, "skipped_tags": [], "pending_users": {}}
             logger.warning(
-                f"Xray {core.version} lacks `api adu`/`rmu` (needs >= 25.7.26); "
-                "falling back to full restart"
+                f"Xray {getattr(core, 'version', None)} lacks `api adu`/`rmu`/`inbounduser` "
+                "(needs >= 25.7.26); falling back to full restart"
             )
-            return False
+            return None
+
+        # Every inbound that has, or had, a client list. One whose "clients"
+        # key is gone from the new config must lose its users too.
+        desired = {}
+        definitions = {}
+        for inbound in new_config.get("inbounds", []):
+            settings = inbound.get("settings") if isinstance(inbound, dict) else None
+            if not isinstance(settings, dict):
+                continue
+            tag = inbound.get("tag")
+            clients = settings.get("clients")
+            if isinstance(clients, list):
+                desired[tag] = clients
+            elif "clients" not in settings and old_clients.get(tag):
+                desired[tag] = []
+            else:
+                continue
+            definitions[tag] = inbound
 
         try:
-            apply_delta(core, new_config, delta)
+            stats = reconcile_users(core, desired, definitions, allow_pending=allow_pending)
         except Exception as exc:
             logger.warning(f"Hot reload failed ({exc}), falling back to full restart")
-            return False
+            return None
 
-        n_added = sum(len(v) for v in delta["added"].values())
-        n_removed = sum(len(v) for v in delta["removed"].values())
-        tags = sorted(set(delta["added"]) | set(delta["removed"]))
-        logger.info(
-            f"Hot-reloaded users without restart: +{n_added} -{n_removed} "
-            f"on inbound(s) {', '.join(tags)}"
-        )
+        if stats["added"] or stats["removed"]:
+            logger.info(
+                f"Hot-reloaded users without restart: +{stats['added']} -{stats['removed']}"
+                + _pending_note(stats)
+            )
+        else:
+            logger.info("Config and live users unchanged, skipping Xray restart" + _pending_note(stats))
         core.config = new_config
-        return True
+        return stats

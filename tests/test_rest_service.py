@@ -79,7 +79,11 @@ def test_base_reports_connected_started_and_version(client, svc):
     res = client.post("/")
     assert res.status_code == 200
     data = res.json()
-    assert data == {"connected": False, "started": False, "core_version": "test-version"}
+    assert data == {
+        "connected": False, "started": False, "core_version": "test-version",
+        # No real Xray binary in tests, so "sync-users" is not advertised.
+        "features": ["keep-core", "ping-status", "gzip"],
+    }
 
 
 def test_first_connect_leaves_a_not_yet_running_core_untouched(client, svc):
@@ -155,7 +159,8 @@ def test_start_that_never_stays_up_returns_503(client, svc, monkeypatch):
 
 def test_restart_uses_hot_reload_and_skips_full_restart(client, svc, monkeypatch):
     sid = _connect(client)
-    monkeypatch.setattr(xray_hot_reload, "try_hot_reload", lambda core, cfg: True)
+    monkeypatch.setattr(xray_hot_reload, "hot_reload", lambda core, cfg, allow_pending=False: {
+        "added": 1, "removed": 0, "unchanged": 2, "skipped_tags": [], "pending_users": {}})
     restart_calls = []
     monkeypatch.setattr(svc.core, "restart", lambda cfg: restart_calls.append(cfg))
     config = json.dumps({"inbounds": [], "outbounds": []})
@@ -168,7 +173,7 @@ def test_restart_uses_hot_reload_and_skips_full_restart(client, svc, monkeypatch
 
 def test_restart_falls_back_to_full_restart_when_hot_reload_declines(client, svc, monkeypatch):
     sid = _connect(client)
-    monkeypatch.setattr(xray_hot_reload, "try_hot_reload", lambda core, cfg: False)
+    monkeypatch.setattr(xray_hot_reload, "hot_reload", lambda core, cfg, allow_pending=False: None)
     monkeypatch.setattr(rest_service, "wait_until_ready", lambda core: True)
     config = json.dumps({"inbounds": [], "outbounds": []})
 
@@ -229,3 +234,205 @@ def test_logs_websocket_streams_buffered_lines(client, svc):
 
     with client.websocket_connect(f"/logs?session_id={sid}") as ws:
         assert ws.receive_text() == "hello xray"
+
+
+# --- keep_core session takeover, status-carrying ping, /sync-users, gzip ---
+
+def test_second_connect_with_keep_core_takes_over_the_running_core(client, svc, monkeypatch):
+    _connect(client)
+    svc.core.started = True
+    monkeypatch.setattr(xray_hot_reload, "can_keep_core", lambda core: True)
+
+    res = client.post("/connect", json={"keep_core": True})
+
+    assert res.status_code == 200
+    assert res.json()["core_kept"] is True
+    assert svc.core.started is True
+    # A fresh session id is still issued: the old one must stop working.
+    assert res.json()["session_id"] == str(svc.session_id)
+
+
+def test_keep_core_is_ignored_when_the_core_cannot_be_reloaded_hot(client, svc, monkeypatch):
+    _connect(client)
+    svc.core.started = True
+    monkeypatch.setattr(xray_hot_reload, "can_keep_core", lambda core: False)
+
+    res = client.post("/connect", json={"keep_core": True})
+
+    assert res.json()["core_kept"] is False
+    assert svc.core.started is False
+
+
+def test_keep_core_is_ignored_for_a_different_client_address(client, svc, monkeypatch):
+    # The running config routes the Xray API to the previous client's IP.
+    _connect(client)
+    svc.core.started = True
+    svc.client_ip = "203.0.113.7"
+    monkeypatch.setattr(xray_hot_reload, "can_keep_core", lambda core: True)
+
+    res = client.post("/connect", json={"keep_core": True})
+
+    assert res.json()["core_kept"] is False
+    assert svc.core.started is False
+
+
+def test_connect_without_keep_core_keeps_the_old_stop_semantics(client, svc, monkeypatch):
+    # An older panel sends no keep_core and relies on the core being stopped.
+    _connect(client)
+    svc.core.started = True
+    monkeypatch.setattr(xray_hot_reload, "can_keep_core", lambda core: True)
+
+    res = client.post("/connect", json={"session_id": None})
+
+    assert res.json()["core_kept"] is False
+    assert svc.core.started is False
+
+
+def test_ping_reports_core_status(client, svc):
+    sid = _connect(client)
+    svc.core.started = True
+
+    data = client.post("/ping", json={"session_id": sid}).json()
+
+    assert data["started"] is True
+    assert data["core_version"] == "test-version"
+    assert "ping-status" in data["features"]
+
+
+def test_sync_users_requires_a_valid_session(client, svc):
+    _connect(client)
+    res = client.post("/sync-users", json={"session_id": str(uuid4()), "clients": {}})
+    assert res.status_code == 403
+
+
+def test_sync_users_returns_the_reconcile_counters(client, svc, monkeypatch):
+    sid = _connect(client)
+    svc.core.started = True
+    seen = {}
+
+    def fake_sync(core, clients, allow_pending=False):
+        seen["clients"] = clients
+        return {"added": 2, "removed": 1, "unchanged": 5, "skipped_tags": ["gone"]}
+
+    monkeypatch.setattr(xray_hot_reload, "sync_users", fake_sync)
+    payload = {"a": [{"email": "1.u", "id": "x"}]}
+
+    res = client.post("/sync-users", json={"session_id": sid, "clients": payload})
+
+    assert res.status_code == 200
+    assert seen["clients"] == payload
+    data = res.json()
+    assert (data["added"], data["removed"], data["unchanged"], data["skipped_tags"]) == (2, 1, 5, ["gone"])
+
+
+def test_sync_users_is_501_when_hot_ops_are_unavailable(client, svc):
+    # FakeCore is "started" but there is no usable Xray CLI in tests.
+    sid = _connect(client)
+    svc.core.started = True
+    svc.core.config = {"inbounds": []}
+
+    res = client.post("/sync-users", json={"session_id": sid, "clients": {}})
+
+    assert res.status_code == 501
+
+
+def test_sync_users_is_503_when_the_core_is_not_running(client, svc):
+    sid = _connect(client)
+
+    res = client.post("/sync-users", json={"session_id": sid, "clients": {}})
+
+    assert res.status_code == 503
+
+
+def test_sync_users_apply_failure_is_500_and_never_restarts(client, svc, monkeypatch):
+    sid = _connect(client)
+    svc.core.started = True
+    restart_calls = []
+    monkeypatch.setattr(svc.core, "restart", lambda cfg: restart_calls.append(cfg))
+
+    def boom(core, clients, allow_pending=False):
+        raise xray_hot_reload.HotReloadError("adu failed")
+
+    monkeypatch.setattr(xray_hot_reload, "sync_users", boom)
+
+    res = client.post("/sync-users", json={"session_id": sid, "clients": {}})
+
+    assert res.status_code == 500
+    assert restart_calls == []
+    assert svc.core.started is True
+
+
+def test_gzip_request_body_is_decompressed(client, svc, monkeypatch):
+    import gzip
+    sid = _connect(client)
+    monkeypatch.setattr(rest_service, "wait_until_ready", lambda core: True)
+    config = json.dumps({"inbounds": [], "outbounds": []})
+    body = gzip.compress(json.dumps({"session_id": sid, "config": config}).encode())
+
+    res = client.post("/start", content=body,
+                      headers={"Content-Type": "application/json", "Content-Encoding": "gzip"})
+
+    assert res.status_code == 200
+    assert svc.core.started is True
+
+
+def test_invalid_gzip_request_body_is_rejected(client, svc):
+    _connect(client)
+
+    res = client.post("/start", content=b"definitely not gzip",
+                      headers={"Content-Type": "application/json", "Content-Encoding": "gzip"})
+
+    assert res.status_code == 400
+    assert svc.core.started is False
+
+
+# --- allow_pending: users the node can't add itself are handed to the panel ---
+
+def test_restart_reports_pending_users_only_to_a_caller_that_asked(client, svc, monkeypatch):
+    sid = _connect(client)
+    seen = []
+
+    def fake_hot_reload(core, cfg, allow_pending=False):
+        seen.append(allow_pending)
+        return {"added": 0, "removed": 0, "unchanged": 0, "skipped_tags": [],
+                "pending_users": {"hy": ["1.a"]} if allow_pending else {}}
+
+    monkeypatch.setattr(xray_hot_reload, "hot_reload", fake_hot_reload)
+    config = json.dumps({"inbounds": [], "outbounds": []})
+
+    plain = client.post("/restart", json={"session_id": sid, "config": config}).json()
+    asked = client.post("/restart", json={"session_id": sid, "config": config, "allow_pending": True}).json()
+
+    assert seen == [False, True]
+    assert plain["pending_users"] == {} and plain["hot_reloaded"] is True
+    assert asked["pending_users"] == {"hy": ["1.a"]}
+
+
+def test_full_restart_answer_carries_no_pending_users(client, svc, monkeypatch):
+    # After a real restart Xray has every user of the config; nothing to push.
+    sid = _connect(client)
+    monkeypatch.setattr(xray_hot_reload, "hot_reload", lambda core, cfg, allow_pending=False: None)
+    monkeypatch.setattr(rest_service, "wait_until_ready", lambda core: True)
+    config = json.dumps({"inbounds": [], "outbounds": []})
+
+    data = client.post("/restart", json={"session_id": sid, "config": config, "allow_pending": True}).json()
+
+    assert "pending_users" not in data and "hot_reloaded" not in data
+
+
+def test_sync_users_passes_allow_pending_through(client, svc, monkeypatch):
+    sid = _connect(client)
+    svc.core.started = True
+    seen = []
+
+    def fake_sync(core, clients, allow_pending=False):
+        seen.append(allow_pending)
+        return {"added": 0, "removed": 0, "unchanged": 0, "skipped_tags": [], "pending_users": {"hy": ["2.b"]}}
+
+    monkeypatch.setattr(xray_hot_reload, "sync_users", fake_sync)
+
+    client.post("/sync-users", json={"session_id": sid, "clients": {}})
+    data = client.post("/sync-users", json={"session_id": sid, "clients": {}, "allow_pending": True}).json()
+
+    assert seen == [False, True]
+    assert data["pending_users"] == {"hy": ["2.b"]}
