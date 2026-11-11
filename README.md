@@ -110,9 +110,15 @@ behaviour.
   config that differs from the running one only in its `clients` lists does
   not restart anything: the node reads the users Xray actually has
   (`api inbounduser`), removes the ones the config doesn't list, adds the
-  missing ones and re-adds the ones it can't vouch for. It used to diff
-  against the config it was last started with, which is stale as soon as
-  the panel adds or removes a user through Xray's gRPC API directly.
+  missing ones, and replaces a user only when the credentials Xray reports
+  for it differ from the wanted ones. It used to diff against the config it
+  was last started with, which is stale as soon as the panel adds or
+  removes a user through Xray's gRPC API directly.
+  `xray api adu` can only add users to vless/vmess/trojan/shadowsocks
+  inbounds. On any other inbound (e.g. Hysteria) users are verified and
+  removed hot, but a config that needs one added or replaced there is
+  refused before anything is touched: `/restart` then does a full restart,
+  `/sync-users` answers `500` and the panel syncs that node user by user.
 - **`POST /sync-users`** (`session_id`, `clients: {inbound tag: [client,
   ...]}`) does only that reconciliation and never restarts or stops the
   core: `501` if hot user operations are unavailable on this node, `503`

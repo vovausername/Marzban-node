@@ -51,6 +51,12 @@ _ADU_CHUNK = 20000
 # Users per remove-then-re-add step, see reconcile_users().
 _REPLACE_CHUNK = 500
 
+# Inbound protocols whose users `xray api adu` can add. For anything else
+# (e.g. hysteria) the CLI answers "unsupported inbound type" and adds
+# nothing, although `rmu` and `inbounduser` work — so on such an inbound
+# users can be listed and removed here, but never (re-)added.
+_ADU_PROTOCOLS = frozenset({"vless", "vmess", "trojan", "shadowsocks"})
+
 # One synchronization boundary around every mutation of the live core:
 # connect/disconnect/start/stop/restart, hot-reload's diff against
 # core.config, and the core.config assignment that follows any of them.
@@ -373,12 +379,13 @@ def _lowercase_map(clients: list):
     return by_email
 
 
-def _list_live_emails(tag: str) -> dict:
-    """{lowercased email: [email as the live process reports it, ...]} for
-    every user Xray currently has on inbound `tag` (one list entry per
-    occurrence: a classic Shadowsocks inbound accepts the same email more
-    than once). Raises HotReloadError when the inbound is unknown to the
-    process or isn't user-manageable."""
+def _list_live_users(tag: str) -> dict:
+    """{lowercased email: [(email, account), ...]} for every user Xray
+    currently has on inbound `tag`: the email as the live process reports
+    it and the account it holds (credentials as Xray prints them). One list
+    entry per occurrence — a classic Shadowsocks inbound accepts the same
+    email more than once. Raises HotReloadError when the inbound is unknown
+    to the process or isn't user-manageable."""
     output = _run_xray_api(["inbounduser", f"-tag={tag}"], timeout=30)
     try:
         users = (json.loads(output) if output.strip() else {}).get("users") or []
@@ -388,8 +395,63 @@ def _list_live_emails(tag: str) -> dict:
     for user in users:
         email = user.get("email") if isinstance(user, dict) else None
         if email:
-            live.setdefault(email.lower(), []).append(email)
+            account = user.get("account")
+            live.setdefault(email.lower(), []).append((email, account if isinstance(account, dict) else {}))
     return live
+
+
+def _list_live_emails(tag: str) -> dict:
+    """{lowercased email: [email, ...]} — _list_live_users() without accounts."""
+    return {key: [email for email, _account in entries] for key, entries in _list_live_users(tag).items()}
+
+
+def _cipher_name(value) -> str:
+    """Shadowsocks cipher spelled the same whether it comes from a config
+    ("chacha20-ietf-poly1305") or from Xray's listing ("CHACHA20_POLY1305")."""
+    return re.sub(r"[^A-Z0-9]", "", str(value).upper()).replace("IETF", "")
+
+
+def _live_account_matches(account: dict, client: dict):
+    """Whether the live `account` of a user (as `api inbounduser` prints it)
+    carries the credentials of the wanted config `client`.
+
+    True: every field Xray reports equals the client's. False: one differs.
+    None: can't tell — Xray reported no credential at all, or a field this
+    doesn't know how to compare.
+    """
+    verified = False
+    for key, value in account.items():
+        if key == "_TypedMessage_":
+            continue
+        if key in ("id", "password", "auth", "key"):
+            # Shadowsocks 2022 reports the user's key; configs call it password.
+            wanted = client.get("password" if key == "key" else key)
+            if wanted is None:
+                return False
+            wanted, value = str(wanted), str(value)
+            if key == "id":  # UUIDs compare case-insensitively
+                wanted, value = wanted.lower(), value.lower()
+            if wanted != value:
+                return False
+            verified = True
+        elif key == "flow":
+            pass  # compared below, also when Xray omits it
+        elif key == "cipherType":
+            if "method" in client and _cipher_name(client["method"]) != _cipher_name(value):
+                return False
+        elif key == "encryption":
+            # VLESS accounts the panel pushes over gRPC carry
+            # encryption "none"; inbound client entries never set it.
+            if str(value or "none") != str(client.get("encryption") or "none"):
+                return None
+        elif key == "securitySettings":
+            if "security" in client:
+                return None
+        else:
+            return None
+    if (account.get("flow") or "") != (client.get("flow") or ""):
+        return False
+    return True if verified else None
 
 
 def _set_tracked_clients(core, tag: str, clients: list) -> None:
@@ -417,10 +479,13 @@ def reconcile_users(core, desired_by_tag: dict, inbound_defs: dict = None) -> di
 
     Per inbound: users the process has but the list doesn't are removed;
     users the list has but the process doesn't are added; a user present
-    on both sides is left alone when core.config already tracks exactly
-    the wanted client entry, and is removed + re-added otherwise (its live
-    credentials can't be verified, e.g. the panel pushed that user itself).
-    Duplicate live entries for one email are collapsed the same way.
+    on both sides is left alone when the credentials Xray reports for it
+    are the wanted ones (or, where Xray reports none, when core.config
+    already tracks exactly the wanted entry), and is removed + re-added
+    otherwise. Duplicate live entries for one email are collapsed the same
+    way. On an inbound whose protocol `xray api adu` can't add users to
+    (see _ADU_PROTOCOLS) users are only ever removed; if it would need one
+    added or replaced the whole call fails before touching anything.
 
     `inbound_defs` supplies the inbound definitions to build `adu` payloads
     from (the CLI needs a complete inbound); core.config's own are used
@@ -468,7 +533,7 @@ def reconcile_users(core, desired_by_tag: dict, inbound_defs: dict = None) -> di
                 continue
             raise HotReloadError(f"inbound {tag!r} has a client without an email or a repeated email")
         try:
-            live = _list_live_emails(tag)
+            live = _list_live_users(tag)
         except HotReloadError:
             if untouched:
                 continue
@@ -476,15 +541,32 @@ def reconcile_users(core, desired_by_tag: dict, inbound_defs: dict = None) -> di
 
         to_drop = []
         to_replace = []
-        for email, occurrences in live.items():
+        for email, entries in live.items():
+            occurrences = [live_email for live_email, _account in entries]
             wanted = desired.get(email)
             if wanted is None:
                 to_drop.extend(occurrences)
-            elif len(occurrences) > 1 or tracked is None or tracked.get(email) != wanted:
-                to_replace.append((occurrences, wanted))
-            else:
+                continue
+            # Trust what the process itself reports about the user's
+            # credentials; only when that says nothing fall back to "the
+            # tracked config already has exactly this entry".
+            matches = _live_account_matches(entries[0][1], wanted) if len(entries) == 1 else False
+            if matches is None:
+                matches = tracked is not None and tracked.get(email) == wanted
+            if matches:
                 unchanged += 1
+            else:
+                to_replace.append((occurrences, wanted))
         to_add = [client for email, client in desired.items() if email not in live]
+
+        if (to_add or to_replace) and inbound.get("protocol") not in _ADU_PROTOCOLS:
+            # Decided here, before anything is removed anywhere: removing a
+            # user this can't add back would cut them off until the caller's
+            # fallback (full restart / per-user sync) gets to them.
+            raise HotReloadError(
+                f"inbound {tag!r} ({inbound.get('protocol')}) needs users added, "
+                "which `xray api adu` can't do for this protocol"
+            )
         plans.append((tag, clients, to_drop, to_replace, to_add))
 
     def _rmu(tag, emails):
@@ -633,13 +715,23 @@ def try_hot_reload(core, new_config: dict) -> bool:
             )
             return False
 
+        # Every inbound that has, or had, a client list. One whose "clients"
+        # key is gone from the new config must lose its users too.
         desired = {}
         definitions = {}
         for inbound in new_config.get("inbounds", []):
             settings = inbound.get("settings") if isinstance(inbound, dict) else None
-            if isinstance(settings, dict) and isinstance(settings.get("clients"), list):
-                desired[inbound.get("tag")] = settings["clients"]
-                definitions[inbound.get("tag")] = inbound
+            if not isinstance(settings, dict):
+                continue
+            tag = inbound.get("tag")
+            clients = settings.get("clients")
+            if isinstance(clients, list):
+                desired[tag] = clients
+            elif "clients" not in settings and old_clients.get(tag):
+                desired[tag] = []
+            else:
+                continue
+            definitions[tag] = inbound
 
         try:
             stats = reconcile_users(core, desired, definitions)

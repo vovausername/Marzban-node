@@ -18,6 +18,7 @@ import time
 import pytest
 
 import xray_hot_reload as hr
+from certificate import generate_certificate
 
 REAL_BINARY = os.environ.get("XRAY_REAL_BINARY")
 
@@ -70,10 +71,24 @@ def xray(monkeypatch, tmp_path):
              "settings": {"clients": [_ss("1.Alice", "p1")], "network": "tcp,udp"}},
             {"tag": "plain", "listen": "127.0.0.1", "port": _free_port(), "protocol": "dokodemo-door",
              "settings": {"address": "127.0.0.1", "clients": []}},
+            {"tag": "ss22", "listen": "127.0.0.1", "port": _free_port(), "protocol": "shadowsocks",
+             "settings": {"method": "2022-blake3-aes-128-gcm", "password": "AAAAAAAAAAAAAAAAAAAAAA==",
+                          "clients": [{"password": "BBBBBBBBBBBBBBBBBBBBBA==", "email": "1.Alice"}],
+                          "network": "tcp,udp"}},
+            {"tag": "hy", "listen": "127.0.0.1", "port": _free_port(), "protocol": "hysteria",
+             "settings": {"version": 2, "clients": [{"auth": "h1", "email": "1.Alice"}]},
+             "streamSettings": {
+                 "network": "hysteria", "security": "tls",
+                 "tlsSettings": {"alpn": ["h3"], "certificates": [
+                     {"certificateFile": str(tmp_path / "cert.pem"), "keyFile": str(tmp_path / "key.pem")}]},
+                 "hysteriaSettings": {"version": 2}}},
         ],
         "outbounds": [{"protocol": "freedom", "tag": "direct"}],
         "routing": {"rules": [{"inboundTag": ["API_INBOUND_LOCAL"], "outboundTag": "API", "type": "field"}]},
     }
+    pems = generate_certificate()
+    (tmp_path / "cert.pem").write_text(pems["cert"])
+    (tmp_path / "key.pem").write_text(pems["key"])
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(config))
     process = subprocess.Popen([REAL_BINARY, "run", "-config", str(config_path)],
@@ -213,3 +228,76 @@ def test_bulk_sync_of_many_users(xray):
     stats = hr.sync_users(xray, {"vless": clients[:10]})
     assert stats["removed"] == 4990
     assert len(_live("vless")) == 10
+
+
+def _calls(monkeypatch):
+    """Record which `xray api` subcommands run from here on."""
+    seen = []
+    real_run = hr._run_xray_api
+
+    def recording(args, payload=None, timeout=3):
+        seen.append(args[0])
+        return real_run(args, payload=payload, timeout=timeout)
+
+    monkeypatch.setattr(hr, "_run_xray_api", recording)
+    return seen
+
+
+def test_untracked_users_with_the_wanted_credentials_are_not_touched(xray, monkeypatch):
+    # Users the panel pushed itself: unknown to core.config, but Xray's own
+    # listing proves they already hold the wanted credentials.
+    _push_directly("vless", _definition(xray, "vless"), [_vless("2.b", 2)])
+    _push_directly("trojan", _definition(xray, "trojan"), [_trojan("2.b", "p2")])
+    _push_directly("ss", _definition(xray, "ss"), [_ss("2.b", "p2")])
+    _push_directly("ss22", _definition(xray, "ss22"),
+                   [{"password": "CCCCCCCCCCCCCCCCCCCCCA==", "email": "2.b"}])
+    seen = _calls(monkeypatch)
+
+    stats = hr.sync_users(xray, {
+        "vless": [_vless("1.Alice", 1), _vless("2.b", 2)],
+        "trojan": [_trojan("1.Alice", "p1"), _trojan("2.b", "p2")],
+        "ss": [_ss("1.Alice", "p1"), _ss("2.b", "p2")],
+        "ss22": [{"password": "BBBBBBBBBBBBBBBBBBBBBA==", "email": "1.Alice"},
+                 {"password": "CCCCCCCCCCCCCCCCCCCCCA==", "email": "2.b"}],
+    })
+
+    assert set(seen) == {"inbounduser"}
+    assert (stats["added"], stats["removed"], stats["unchanged"]) == (0, 0, 8)
+
+
+def test_live_user_with_other_credentials_is_replaced_even_if_tracked(xray):
+    # The panel rotated the user over gRPC and the DB now says something
+    # else again: core.config matches the wanted entry, the process doesn't.
+    hr._run_xray_api(["rmu", "-tag=vless", "1.Alice"])
+    _push_directly("vless", _definition(xray, "vless"), [_vless("1.Alice", 777)])
+
+    stats = hr.sync_users(xray, {"vless": [_vless("1.Alice", 1)]})
+
+    assert (stats["added"], stats["removed"]) == (1, 1)
+    account = hr._list_live_users("vless")["1.alice"][0][1]
+    assert account["id"] == _vless("1.Alice", 1)["id"]
+
+
+def test_hysteria_users_are_verified_and_removed_but_never_cut_off(xray):
+    hy = [{"auth": "h1", "email": "1.Alice"}]
+    assert hr._live_account_matches(hr._list_live_users("hy")["1.alice"][0][1], hy[0]) is True
+
+    # Unchanged: fine. A user it should not have: removed.
+    assert hr.sync_users(xray, {"hy": hy})["unchanged"] == 1
+
+    # `adu` can't add Hysteria users: a sync that would need to must fail
+    # before removing anything, on this inbound or any other.
+    _push_directly("vless", _definition(xray, "vless"), [_vless("9.ghost", 9)])
+    for wanted in ([{"auth": "rotated", "email": "1.Alice"}],
+                   hy + [{"auth": "h2", "email": "2.b"}]):
+        with pytest.raises(hr.HotReloadError):
+            hr.sync_users(xray, {"vless": [_vless("1.Alice", 1)], "hy": wanted})
+        assert _live("hy") == ["1.Alice"]
+        assert _live("vless") == ["1.Alice", "9.ghost"]
+
+    # ...and the same change on /restart falls back to a full restart.
+    new_config = json.loads(json.dumps(xray.config))
+    next(i for i in new_config["inbounds"] if i["tag"] == "hy")["settings"]["clients"] = hy + [
+        {"auth": "h2", "email": "2.b"}]
+    assert hr.try_hot_reload(xray, new_config) is False
+    assert _live("hy") == ["1.Alice"]
