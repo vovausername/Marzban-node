@@ -85,6 +85,7 @@ def xray(monkeypatch, tmp_path):
         ],
         "outbounds": [{"protocol": "freedom", "tag": "direct"}],
         "routing": {"rules": [{"inboundTag": ["API_INBOUND_LOCAL"], "outboundTag": "API", "type": "field"}]},
+        "policy": {"levels": {"0": {}, "3": {}}},
     }
     pems = generate_certificate()
     (tmp_path / "cert.pem").write_text(pems["cert"])
@@ -137,10 +138,11 @@ def test_cli_probe_finds_the_user_commands(xray):
 
 def test_listing_reports_live_users_per_inbound(xray):
     assert _live("vless") == ["1.Alice"]
-    with pytest.raises(hr.HotReloadError):
-        hr._list_live_emails("plain")  # not a UserManager
-    with pytest.raises(hr.HotReloadError):
+    with pytest.raises(hr.NotUserManageable):
+        hr._list_live_emails("plain")  # a protocol without users
+    with pytest.raises(hr.HotReloadError) as unknown_tag:
         hr._list_live_emails("no-such-tag")
+    assert not isinstance(unknown_tag.value, hr.NotUserManageable)
 
 
 def test_sync_heals_every_kind_of_drift(xray):
@@ -318,3 +320,27 @@ def test_allow_pending_keeps_hysteria_from_blocking_the_rest(xray):
 
     # In sync again once nothing is pending.
     assert hr.sync_users(xray, {"hy": hy}, allow_pending=True)["pending_users"] == {}
+
+
+def test_unreachable_xray_fails_a_sync_even_when_nothing_changed(xray, monkeypatch):
+    # Point the CLI at a port nothing listens on: the live state is unknown,
+    # which must not be reported as "in sync".
+    monkeypatch.setattr(hr, "XRAY_LOCAL_API_PORT", _free_port())
+
+    with pytest.raises(hr.HotReloadError) as failure:
+        hr.sync_users(xray, {"vless": [_vless("1.Alice", 1)]})
+    assert not isinstance(failure.value, hr.NotUserManageable)
+    assert hr.try_hot_reload(xray, json.loads(json.dumps(xray.config))) is False
+
+
+def test_level_only_change_is_applied(xray):
+    wanted = dict(_vless("1.Alice", 1), level=3)
+
+    stats = hr.sync_users(xray, {"vless": [wanted]})
+    assert (stats["added"], stats["removed"]) == (1, 1)
+    assert hr._list_live_users("vless")["1.alice"][0][2] == 3
+
+    # Converged, and back to level 0 is a change again.
+    assert hr.sync_users(xray, {"vless": [wanted]})["unchanged"] == 1
+    assert hr.sync_users(xray, {"vless": [_vless("1.Alice", 1)]})["removed"] == 1
+    assert hr._list_live_users("vless")["1.alice"][0][2] == 0

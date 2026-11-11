@@ -144,6 +144,8 @@ class FakeXray:
         self.calls = []
         self.fail_adu = False
         self.accounts = {}  # (tag, email) -> account as `inbounduser` prints it
+        self.levels = {}  # (tag, email) -> policy level (Xray omits 0)
+        self.listing_error = None  # e.g. "failed to dial 127.0.0.1:62052"
 
     def __call__(self, args, payload=None, timeout=3):
         import json
@@ -152,7 +154,10 @@ class FakeXray:
             tag = args[1].split("=", 1)[1]
             if tag in self.not_user_managers or tag not in self.live:
                 raise hr.HotReloadError("xray api inbounduser failed: proxy is not a UserManager")
-            users = [{"account": self.accounts.get((tag, email), {}), "email": email}
+            if self.listing_error:
+                raise hr.HotReloadError(self.listing_error)
+            users = [{"account": self.accounts.get((tag, email), {}), "email": email,
+                      **({"level": self.levels[(tag, email)]} if self.levels.get((tag, email)) else {})}
                      for email in self.live[tag]]
             return json.dumps({"users": users} if users else {})
         if args[0] == "rmu":
@@ -620,3 +625,69 @@ def test_masque_password_is_verified_against_the_config_pass_field():
     m = hr._live_account_matches
     assert m({"password": "p"}, {"pass": "p", "email": "1.a"}) is True
     assert m({"password": "p"}, {"pass": "other"}) is False
+
+
+# --- listing failures and policy levels ---
+
+def test_failed_listing_is_never_mistaken_for_an_inbound_without_users(monkeypatch):
+    # Xray unreachable / timed out: the live state is unknown. Even with an
+    # unchanged client list this must fail (the caller retries or falls
+    # back) instead of reporting a sync that never looked at anything.
+    for error in ("xray api inbounduser failed: failed to dial 127.0.0.1:62052",
+                  "xray api inbounduser timed out"):
+        core = _Core(_config([_c("1.a")]))
+        fake = FakeXray({"a": ["1.a", "9.ghost"]})
+        fake.listing_error = error
+        _use_fake_xray(monkeypatch, fake)
+
+        try:
+            hr.reconcile_users(core, {"a": [_c("1.a")]})
+        except hr.NotUserManageable:
+            raise AssertionError("an operational failure must not look like 'no users here'")
+        except hr.HotReloadError:
+            pass
+        else:
+            raise AssertionError("expected HotReloadError")
+        assert hr.try_hot_reload(core, _config([_c("1.a")])) is False
+
+
+def test_unparsable_listing_fails_the_call(monkeypatch):
+    core = _Core(_config([_c("1.a")]))
+    monkeypatch.setattr(hr, "_run_xray_api", lambda args, payload=None, timeout=3: "not json")
+    monkeypatch.setattr(hr, "_cli_supports_user_ops", lambda version: True)
+
+    try:
+        hr.reconcile_users(core, {"a": [_c("1.a")]})
+    except hr.HotReloadError:
+        pass
+    else:
+        raise AssertionError("expected HotReloadError")
+
+
+def test_user_whose_only_change_is_its_level_is_replaced(monkeypatch):
+    for live_level, wanted_level in ((0, 3), (3, 0), (3, 5)):
+        tracked = dict(_c("1.a"), **({"level": live_level} if live_level else {}))
+        wanted = dict(_c("1.a"), **({"level": wanted_level} if wanted_level else {}))
+        core = _Core(_config([tracked]))
+        fake = FakeXray({"a": ["1.a"]})
+        fake.accounts[("a", "1.a")] = {"id": "uuid-1.a"}
+        fake.levels[("a", "1.a")] = live_level
+        _use_fake_xray(monkeypatch, fake)
+
+        stats = hr.reconcile_users(core, {"a": [wanted]})
+
+        assert fake.calls == ["inbounduser", "rmu", "adu"], (live_level, wanted_level)
+        assert (stats["added"], stats["removed"]) == (1, 1)
+
+
+def test_user_with_the_wanted_level_is_left_alone(monkeypatch):
+    core = _Core(_config([]))
+    fake = FakeXray({"a": ["1.a"]})
+    fake.accounts[("a", "1.a")] = {"id": "uuid-1.a"}
+    fake.levels[("a", "1.a")] = 3
+    _use_fake_xray(monkeypatch, fake)
+
+    stats = hr.reconcile_users(core, {"a": [dict(_c("1.a"), level=3)]})
+
+    assert fake.calls == ["inbounduser"]
+    assert stats["unchanged"] == 1

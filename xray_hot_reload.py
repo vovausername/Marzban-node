@@ -78,6 +78,11 @@ class HotReloadError(Exception):
     pass
 
 
+class NotUserManageable(HotReloadError):
+    """Xray has the inbound, but its protocol has no users to list or
+    change — as opposed to failing to ask Xray at all."""
+
+
 class HotReloadUnavailable(HotReloadError):
     """User hot-ops can't be used on this node right now (feature off, old
     Xray binary, core not running) — as opposed to a failed apply."""
@@ -380,13 +385,22 @@ def _lowercase_map(clients: list):
 
 
 def _list_live_users(tag: str) -> dict:
-    """{lowercased email: [(email, account), ...]} for every user Xray
-    currently has on inbound `tag`: the email as the live process reports
-    it and the account it holds (credentials as Xray prints them). One list
-    entry per occurrence — a classic Shadowsocks inbound accepts the same
-    email more than once. Raises HotReloadError when the inbound is unknown
-    to the process or isn't user-manageable."""
-    output = _run_xray_api(["inbounduser", f"-tag={tag}"], timeout=30)
+    """{lowercased email: [(email, account, level), ...]} for every user
+    Xray currently has on inbound `tag`: the email as the live process
+    reports it, the account it holds (credentials as Xray prints them) and
+    its policy level. One list entry per occurrence — a classic Shadowsocks
+    inbound accepts the same email more than once.
+
+    Raises NotUserManageable when the inbound's protocol has no users, and
+    plain HotReloadError for everything else (Xray unreachable, timeout,
+    unknown tag, unparsable answer): only the former says anything about
+    the inbound, the rest means the live state is simply unknown."""
+    try:
+        output = _run_xray_api(["inbounduser", f"-tag={tag}"], timeout=30)
+    except HotReloadError as exc:
+        if "not a usermanager" in str(exc).lower():
+            raise NotUserManageable(str(exc))
+        raise
     try:
         users = (json.loads(output) if output.strip() else {}).get("users") or []
     except (ValueError, AttributeError):
@@ -396,13 +410,23 @@ def _list_live_users(tag: str) -> dict:
         email = user.get("email") if isinstance(user, dict) else None
         if email:
             account = user.get("account")
-            live.setdefault(email.lower(), []).append((email, account if isinstance(account, dict) else {}))
+            live.setdefault(email.lower(), []).append(
+                (email, account if isinstance(account, dict) else {}, user.get("level") or 0))
     return live
 
 
 def _list_live_emails(tag: str) -> dict:
     """{lowercased email: [email, ...]} — _list_live_users() without accounts."""
-    return {key: [email for email, _account in entries] for key, entries in _list_live_users(tag).items()}
+    return {key: [entry[0] for entry in entries] for key, entries in _list_live_users(tag).items()}
+
+
+def _same_level(live_level, client: dict) -> bool:
+    """Whether the live user's policy level is the one the client entry
+    asks for (Xray omits level 0 from its listing, configs usually too)."""
+    try:
+        return int(live_level or 0) == int(client.get("level") or 0)
+    except (TypeError, ValueError):
+        return False
 
 
 def _cipher_name(value) -> str:
@@ -540,9 +564,13 @@ def reconcile_users(core, desired_by_tag: dict, inbound_defs: dict = None,
         untouched = (tracked_list or []) == clients
 
         # An inbound this can't reconcile — a client without an email, a
-        # repeated email, or a protocol whose users Xray can't list — is
+        # repeated email, or a protocol that has no users in Xray — is
         # left alone as long as its client list is the one already tracked
         # (nothing was asked to change on it), and fails the call otherwise.
+        # A listing that failed for any other reason (Xray unreachable,
+        # timeout, garbage) always fails the call: the live state is
+        # unknown then, and reporting success would hide exactly the drift
+        # this exists to repair.
         desired = _lowercase_map(clients)
         if desired is None:
             if untouched:
@@ -550,7 +578,7 @@ def reconcile_users(core, desired_by_tag: dict, inbound_defs: dict = None,
             raise HotReloadError(f"inbound {tag!r} has a client without an email or a repeated email")
         try:
             live = _list_live_users(tag)
-        except HotReloadError:
+        except NotUserManageable:
             if untouched:
                 continue
             raise
@@ -558,7 +586,7 @@ def reconcile_users(core, desired_by_tag: dict, inbound_defs: dict = None,
         to_drop = []
         to_replace = []
         for email, entries in live.items():
-            occurrences = [live_email for live_email, _account in entries]
+            occurrences = [entry[0] for entry in entries]
             wanted = desired.get(email)
             if wanted is None:
                 to_drop.extend(occurrences)
@@ -569,6 +597,10 @@ def reconcile_users(core, desired_by_tag: dict, inbound_defs: dict = None,
             matches = _live_account_matches(entries[0][1], wanted) if len(entries) == 1 else False
             if matches is None:
                 matches = tracked is not None and tracked.get(email) == wanted
+            # The level lives on the user, not in the account: same
+            # credentials under another policy level is still a change.
+            if matches and not _same_level(entries[0][2], wanted):
+                matches = False
             if matches:
                 unchanged += 1
             else:
