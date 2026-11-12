@@ -127,6 +127,9 @@ XRAY_LOCAL_API_PORT = config("XRAY_LOCAL_API_PORT", cast=int, default=62052)
 # XRAY_HOT_RELOAD_ENABLED as its on/off switch since both features depend
 # on the same loopback plaintext API inbound.
 XRAY_HOT_ADD_TIMEOUT_SECONDS = config("XRAY_HOT_ADD_TIMEOUT_SECONDS", cast=int, default=10)
+# Upper cap for `api inbounduser`; the actual timeout scales with the inbound's
+# user count (30 s floor, see xray_hot_reload._inbounduser_timeout).
+XRAY_INBOUNDUSER_TIMEOUT_SECONDS = config("XRAY_INBOUNDUSER_TIMEOUT_SECONDS", cast=int, default=120)
 
 # How long to watch a freshly (re)started Xray process before trusting that
 # it actually stayed up, and how often to poll it while watching. Used by

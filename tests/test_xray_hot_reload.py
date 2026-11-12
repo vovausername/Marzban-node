@@ -2,6 +2,7 @@
 network calls — cheap to pin down, and it's the crux of the hot-reload
 path that lets a user add/remove avoid a full Xray restart.
 """
+import pytest
 import xray_hot_reload as hr
 
 
@@ -691,3 +692,38 @@ def test_user_with_the_wanted_level_is_left_alone(monkeypatch):
 
     assert fake.calls == ["inbounduser"]
     assert stats["unchanged"] == 1
+
+
+def test_inbounduser_timeout_scales_with_users():
+    assert hr._inbounduser_timeout(0) == 30
+    assert hr._inbounduser_timeout(2000) == 30
+    assert hr._inbounduser_timeout(5000) == 60
+    assert hr._inbounduser_timeout(10 ** 6) == max(30, hr.XRAY_INBOUNDUSER_TIMEOUT_SECONDS)
+
+
+def test_sync_deadline_budget():
+    assert hr._sync_deadline_budget(0) == 160
+    assert hr._sync_deadline_budget(165000) == 60 + 165000 // 400 - 20
+
+
+def test_run_xray_api_respects_deadline(monkeypatch):
+    import time
+    seen = {}
+
+    class R:
+        returncode, stdout, stderr = 0, "", ""
+
+    def fake_run(cmd, **kw):
+        seen["t"] = cmd[cmd.index("-timeout") + 1]
+        return R()
+
+    monkeypatch.setattr(hr.subprocess, "run", fake_run)
+    hr._deadline_state.deadline = time.monotonic() + 5
+    try:
+        hr._run_xray_api(["inbounduser", "-tag=x"], timeout=90)
+        assert int(seen["t"]) <= 5
+        hr._deadline_state.deadline = time.monotonic() - 1
+        with pytest.raises(hr.HotReloadError, match="deadline"):
+            hr._run_xray_api(["inbounduser", "-tag=x"], timeout=90)
+    finally:
+        hr._deadline_state.deadline = None
