@@ -21,6 +21,7 @@ import json
 import re
 import subprocess
 import threading
+import time
 
 from config import (INBOUNDS, XRAY_EXECUTABLE_PATH,
                     XRAY_HOT_ADD_TIMEOUT_SECONDS, XRAY_HOT_RELOAD_ENABLED,
@@ -199,7 +200,27 @@ def compute_client_delta(old_config: dict, new_config: dict):
     return {"added": added, "removed": removed}
 
 
+# Overall budget of one reconcile_users() call. The panel gives /sync-users
+# max(180, 60 + entries // 400) seconds (Marzban app/xray/node.py
+# _user_sync_timeout); stop a bit earlier (a CLI call may overrun its
+# -timeout by up to 12 s) so a hung Xray doesn't keep this worker busy long
+# after the panel gave up and fell back to per-user sync.
+_SYNC_PANEL_MIN_TIMEOUT = 180
+_SYNC_DEADLINE_MARGIN = 20
+_deadline_state = threading.local()
+
+
+def _sync_deadline_budget(client_entries: int) -> int:
+    return max(_SYNC_PANEL_MIN_TIMEOUT, 60 + client_entries // 400) - _SYNC_DEADLINE_MARGIN
+
+
 def _run_xray_api(args: list, payload: str = None, timeout: int = 3) -> str:
+    deadline = getattr(_deadline_state, "deadline", None)
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining < 1:
+            raise HotReloadError(f"xray api {args[0]} skipped: sync deadline exceeded")
+        timeout = max(1, min(timeout, int(remaining)))
     # Flags must precede positional args (emails / stdin:) — Go's flag
     # parser stops at the first non-flag argument.
     cmd = [
@@ -512,6 +533,16 @@ def _set_tracked_clients(core, tag: str, clients: list) -> None:
 
 def reconcile_users(core, desired_by_tag: dict, inbound_defs: dict = None,
                     allow_pending: bool = False) -> dict:
+    entries = sum(len(c) for c in desired_by_tag.values() if isinstance(c, list))
+    _deadline_state.deadline = time.monotonic() + _sync_deadline_budget(entries)
+    try:
+        return _reconcile_users(core, desired_by_tag, inbound_defs, allow_pending)
+    finally:
+        _deadline_state.deadline = None
+
+
+def _reconcile_users(core, desired_by_tag: dict, inbound_defs: dict = None,
+                     allow_pending: bool = False) -> dict:
     """Make the live process hold exactly `desired_by_tag[tag]` on each
     listed inbound, without restarting it.
 
