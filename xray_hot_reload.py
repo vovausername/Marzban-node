@@ -24,6 +24,7 @@ import threading
 
 from config import (INBOUNDS, XRAY_EXECUTABLE_PATH,
                     XRAY_HOT_ADD_TIMEOUT_SECONDS, XRAY_HOT_RELOAD_ENABLED,
+                    XRAY_INBOUNDUSER_TIMEOUT_SECONDS,
                     XRAY_LOCAL_API_PORT)
 from logger import logger
 
@@ -396,7 +397,8 @@ def _list_live_users(tag: str) -> dict:
     unknown tag, unparsable answer): only the former says anything about
     the inbound, the rest means the live state is simply unknown."""
     try:
-        output = _run_xray_api(["inbounduser", f"-tag={tag}"], timeout=30)
+        output = _run_xray_api(["inbounduser", f"-tag={tag}"],
+                               timeout=XRAY_INBOUNDUSER_TIMEOUT_SECONDS)
     except HotReloadError as exc:
         if "not a usermanager" in str(exc).lower():
             raise NotUserManageable(str(exc))
