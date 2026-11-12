@@ -691,3 +691,10 @@ def test_user_with_the_wanted_level_is_left_alone(monkeypatch):
 
     assert fake.calls == ["inbounduser"]
     assert stats["unchanged"] == 1
+
+
+def test_inbounduser_timeout_scales_with_users():
+    assert hr._inbounduser_timeout(0) == 30
+    assert hr._inbounduser_timeout(2000) == 30
+    assert hr._inbounduser_timeout(5000) == 60
+    assert hr._inbounduser_timeout(10 ** 6) == max(30, hr.XRAY_INBOUNDUSER_TIMEOUT_SECONDS)
