@@ -1,0 +1,48 @@
+{
+  "version": "Xray 26.9.9 (Xray, Penetrates Everything.) 52a412d (go1.27.1 linux/amd64)",
+  "functional": "PASS: add/remove, two inbounds, user AND domain, established connection preserved",
+  "priority": "PASS: earlier catch-all overrides later squad rule",
+  "empty_user": "CONFIRMED: user=[] matches other users; omit entire squad rule instead",
+  "update_10000": {
+    "seconds": 0.08259603600163246,
+    "returncode": 0,
+    "stderr": ""
+  },
+  "sequential_connection_benchmark": {
+    "baseline": {
+      "samples": 300,
+      "median_ms": 0.7055754995235475,
+      "p95_ms": 1.1471449979580939
+    },
+    "one_rule_10000": {
+      "samples": 300,
+      "median_ms": 0.6409084999177139,
+      "p95_ms": 0.9118810012296308
+    },
+    "ten_rules_10000": {
+      "samples": 300,
+      "median_ms": 0.6709184999635909,
+      "p95_ms": 1.0471749992575496
+    }
+  },
+  "concurrent_replacements": {
+    "updates": 25,
+    "connections": {
+      "Sx": 7162,
+      "Nx": 0,
+      "error": 0
+    }
+  },
+  "invalid_replacement": {
+    "seconds": 0.19132161300149164,
+    "returncode": 1,
+    "stderr": "xray api adrules failed: failed to perform AddRule: rpc error: code = Unknown desc = app/router: duplicate ruleTag marzban-squad-duplicate"
+  },
+  "after_invalid_replacement": "Sx",
+  "api_after_invalid_replacement": {
+    "seconds": 0.0004528400022536516,
+    "returncode": 0,
+    "stderr": ""
+  },
+  "verdict": "PASS"
+}

@@ -18,6 +18,7 @@ against the loopback plaintext API inbound that xray.py injects — the CLI
 only speaks plaintext gRPC, so it can't use the panel's TLS API inbound.
 """
 import json
+import os
 import re
 import subprocess
 import threading
@@ -214,7 +215,7 @@ def _sync_deadline_budget(client_entries: int) -> int:
     return max(_SYNC_PANEL_MIN_TIMEOUT, 60 + client_entries // 400) - _SYNC_DEADLINE_MARGIN
 
 
-def _run_xray_api(args: list, payload: str = None, timeout: int = 3) -> str:
+def _run_xray_api(args: list, payload: str = None, timeout: int = 3, assets_path: str = None) -> str:
     deadline = getattr(_deadline_state, "deadline", None)
     if deadline is not None:
         remaining = deadline - time.monotonic()
@@ -231,7 +232,8 @@ def _run_xray_api(args: list, payload: str = None, timeout: int = 3) -> str:
     ]
     try:
         result = subprocess.run(cmd, input=payload, capture_output=True,
-                                text=True, timeout=timeout + 12)
+                                text=True, timeout=timeout + 12,
+                                **({"env": {**os.environ, "XRAY_LOCATION_ASSET": assets_path}} if assets_path else {}))
     except subprocess.TimeoutExpired:
         raise HotReloadError(f"xray api {args[0]} timed out")
     if result.returncode != 0:
@@ -813,7 +815,20 @@ def hot_reload(core, new_config: dict, allow_pending: bool = False):
         old_stripped, old_clients = _strip_clients(old_config)
         new_stripped, new_clients = _strip_clients(new_config)
         if not _same_structure(old_stripped, new_stripped):
-            return None
+            # Reconnect/start may carry a newer squad snapshot. Apply only a
+            # managed-routing delta here; unrelated config edits retain the
+            # existing full-config behavior. Errors must not trigger a restart.
+            import routing_sync
+            old_base = dict(old_stripped)
+            new_base = dict(new_stripped)
+            old_routing = old_base.pop("routing", {})
+            new_routing = new_base.pop("routing", {})
+            if (not routing_sync.supported(getattr(core, "version", None)) or
+                    not _same_structure(old_base, new_base) or
+                    routing_sync.normalize(old_routing, True) != routing_sync.normalize(new_routing, True)):
+                return None
+            routing_sync.sync(core, routing_sync.digest(routing_sync.normalize(new_routing)),
+                              routing_sync.digest(routing_sync.normalize(old_routing, True)), new_routing)
 
         if not _cli_supports_user_ops(getattr(core, "version", None)):
             if old_clients == new_clients:

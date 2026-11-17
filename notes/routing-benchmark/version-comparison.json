@@ -1,0 +1,118 @@
+{
+  "26.7.28_load_False": {
+    "cold": {
+      "seconds": 3.5329993490013294,
+      "code": 0,
+      "error": ""
+    },
+    "identical": {
+      "median": 3.127729353000177,
+      "max": 3.3384992830033298
+    },
+    "members": {
+      "median": 3.0830846129974816,
+      "max": 3.507025065999187
+    },
+    "forced_timeout": {
+      "seconds": 1.0111920519993873,
+      "code": 1,
+      "error": "failed to dial 127.0.0.1:54479"
+    },
+    "route_after_timeout": "special",
+    "retry": {
+      "seconds": 3.113216290999844,
+      "code": 0,
+      "error": ""
+    },
+    "route_after_retry": "special",
+    "cache_hits": 0,
+    "cache_misses": 882
+  },
+  "26.7.28_load_True": {
+    "cold": {
+      "seconds": 8.904467940999893,
+      "code": 0,
+      "error": ""
+    },
+    "identical": {
+      "median": 8.991998068504472,
+      "max": 9.865057786999387
+    },
+    "members": {
+      "median": 9.216808474498976,
+      "max": 10.050805752995075
+    },
+    "forced_timeout": {
+      "seconds": 1.0210578609985532,
+      "code": 1,
+      "error": "failed to dial 127.0.0.1:52079"
+    },
+    "route_after_timeout": "special",
+    "retry": {
+      "seconds": 8.897200437997526,
+      "code": 0,
+      "error": ""
+    },
+    "route_after_retry": "special",
+    "cache_hits": 0,
+    "cache_misses": 882
+  },
+  "26.9.9_load_False": {
+    "cold": {
+      "seconds": 3.8034593039992615,
+      "code": 0,
+      "error": ""
+    },
+    "identical": {
+      "median": 0.07966901249892544,
+      "max": 0.1061027899995679
+    },
+    "members": {
+      "median": 0.07321803950253525,
+      "max": 0.09575677400425775
+    },
+    "forced_timeout": {
+      "seconds": 1.0238015450013336,
+      "code": 1,
+      "error": "failed to dial 127.0.0.1:42431"
+    },
+    "route_after_timeout": "special",
+    "retry": {
+      "seconds": 0.07046545800403692,
+      "code": 0,
+      "error": ""
+    },
+    "route_after_retry": "special",
+    "cache_hits": 861,
+    "cache_misses": 21
+  },
+  "26.9.9_load_True": {
+    "cold": {
+      "seconds": 8.707057136001822,
+      "code": 0,
+      "error": ""
+    },
+    "identical": {
+      "median": 0.20683467000344535,
+      "max": 0.23484413999540266
+    },
+    "members": {
+      "median": 0.1977306514963857,
+      "max": 0.2767267500021262
+    },
+    "forced_timeout": {
+      "seconds": 1.0239752730049076,
+      "code": 1,
+      "error": "failed to dial 127.0.0.1:45483"
+    },
+    "route_after_timeout": "special",
+    "retry": {
+      "seconds": 0.2005682790040737,
+      "code": 0,
+      "error": ""
+    },
+    "route_after_retry": "special",
+    "cache_hits": 861,
+    "cache_misses": 21
+  }
+}

@@ -126,6 +126,7 @@ class Service(object):
         self.router.add_api_route("/add-outbound", self.add_outbound, methods=["POST"])
         self.router.add_api_route("/remove-inbound", self.remove_inbound, methods=["POST"])
         self.router.add_api_route("/remove-outbound", self.remove_outbound, methods=["POST"])
+        self.router.add_api_route("/sync-routing", self.sync_routing, methods=["POST"])
         self.router.add_api_route("/sync-users", self.sync_users, methods=["POST"])
         self.router.add_api_route("/update-xray", self.update_xray, methods=["POST"])
         self.router.add_api_route("/check-for-update", self.check_for_update, methods=["POST"])
@@ -164,6 +165,9 @@ class Service(object):
                 features.append("sync-users")
         except Exception:
             pass
+        import routing_sync
+        if XRAY_HOT_RELOAD_ENABLED and routing_sync.supported(getattr(self.core, "version", None)):
+            features.append("sync-routing")
         return features
 
     def response(self, **kwargs):
@@ -379,6 +383,20 @@ class Service(object):
             except xray_hot_reload.HotReloadError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
             return self.response(detail=output.strip())
+
+    def sync_routing(self, session_id: UUID = Body(embed=True),
+                     desired_hash: str = Body(embed=True), base_hash: str = Body(embed=True),
+                     routing: dict = Body(None, embed=True)):
+        import routing_sync
+        with xray_hot_reload.core_lock:
+            self.match_session_id(session_id)
+            if not XRAY_HOT_RELOAD_ENABLED:
+                raise HTTPException(403, "Hot reload is disabled")
+            try:
+                result = routing_sync.sync(self.core, desired_hash, base_hash, routing)
+            except (ValueError, xray_hot_reload.HotReloadError) as exc:
+                raise HTTPException(409, str(exc))
+            return self.response(**result)
 
     def add_outbound(self, session_id: UUID = Body(embed=True), outbound: dict = Body(embed=True)):
         self.match_session_id(session_id)
