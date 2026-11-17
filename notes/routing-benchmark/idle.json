@@ -1,0 +1,66 @@
+{
+  "categories": [
+    "category-ads-all",
+    "cn",
+    "china-list",
+    "geolocation-!cn",
+    "category-companies",
+    "category-porn",
+    "geolocation-cn",
+    "gfw",
+    "category-entertainment",
+    "apple",
+    "category-media",
+    "category-ecommerce",
+    "category-games",
+    "category-ru",
+    "alphabet",
+    "google",
+    "bytedance",
+    "category-games-!cn",
+    "category-ads",
+    "tld-!cn"
+  ],
+  "xray": "Xray 26.9.9 (Xray, Penetrates Everything.) 52a412d (go1.27.1 linux/amd64)",
+  "measurements": {
+    "cli_200": {
+      "seconds": [
+        0.09568046999993385,
+        0.09310405599899241,
+        0.0772265529994911,
+        0.08050791200003005
+      ],
+      "median": 0.08680598399951123
+    },
+    "cached_grpc_200": {
+      "seconds": [
+        0.04749809599888977,
+        0.0572981900004379,
+        0.059948185000394005,
+        0.04708516500249971
+      ],
+      "median": 0.05239814299966383
+    },
+    "cli_10000": {
+      "seconds": [
+        0.08236553100141464,
+        0.11095697899872903,
+        0.07886333000351442,
+        0.0832328550022794
+      ],
+      "median": 0.08279919300184702
+    },
+    "cached_grpc_10000": {
+      "seconds": [
+        0.04971720300090965,
+        0.04613055899972096,
+        0.0689277259989467,
+        0.047533689001284074
+      ],
+      "median": 0.04862544600109686
+    }
+  },
+  "compile_seconds": 0.03909935199772008,
+  "protobuf_bytes": 1178,
+  "atomic_rejection_preserves_routes": true
+}
