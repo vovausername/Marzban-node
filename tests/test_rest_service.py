@@ -13,8 +13,10 @@ import time is exercised too. `service.core` is swapped for a FakeCore
 stand-in per test so nothing here ever shells out to a real Xray binary.
 """
 import json
+import logging
 from collections import deque
 from contextlib import contextmanager
+from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
@@ -22,6 +24,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import rest_service
+import routing_sync
 import xray_hot_reload
 
 
@@ -84,6 +87,47 @@ def test_base_reports_connected_started_and_version(client, svc):
         # No real Xray binary in tests, so "sync-users" is not advertised.
         "features": ["keep-core", "ping-status", "gzip"],
     }
+
+
+def test_routing_sync_logs_check_and_apply_outcomes(client, svc, monkeypatch, caplog):
+    sid = _connect(client)
+    monkeypatch.setattr(rest_service, "XRAY_HOT_RELOAD_ENABLED", True)
+    caplog.set_level(logging.DEBUG, logger="logger")
+    svc.core.version = "26.9.9"
+    svc.core.started = True
+    svc.core.config = {
+        "routing": {"rules": [{"outboundTag": "API"}]},
+        "outbounds": [{"tag": "direct"}],
+    }
+    desired = {"rules": [{"ruleTag": "marzban-squad-1", "outboundTag": "direct"}]}
+    hashes = {
+        "session_id": sid,
+        "desired_hash": routing_sync.digest(desired),
+        "base_hash": routing_sync.digest({"rules": []}),
+    }
+    cli_error = xray_hot_reload.HotReloadError(
+        "rpc error: code = DeadlineExceeded desc = private-rule-content"
+    )
+    run = Mock(side_effect=[cli_error, ""])
+    monkeypatch.setattr(xray_hot_reload, "_run_xray_api", run)
+
+    check = client.post("/sync-routing", json=hashes)
+    failed = client.post("/sync-routing", json={**hashes, "routing": desired})
+    applied = client.post("/sync-routing", json={**hashes, "routing": desired})
+    confirmed = client.post("/sync-routing", json=hashes)
+
+    assert check.status_code == 200 and check.json()["needs_config"]
+    assert failed.status_code == 409
+    assert applied.status_code == confirmed.status_code == 200
+    assert applied.json()["applied_hash"] == confirmed.json()["applied_hash"] == hashes["desired_hash"]
+    assert run.call_count == 2
+    assert "stage=check outcome=needs_config lock_wait_ms=" in caplog.text
+    assert "stage=apply outcome=apply_failed lock_wait_ms=" in caplog.text
+    assert "outcome=failed duration_ms=" in caplog.text
+    assert "timeout_s=15 grpc_status=DeadlineExceeded" in caplog.text
+    assert "outcome=applied duration_ms=" in caplog.text
+    assert "stage=check outcome=hash_acknowledged lock_wait_ms=" in caplog.text
+    assert "private-rule-content" not in caplog.text
 
 
 def test_first_connect_leaves_a_not_yet_running_core_untouched(client, svc):
