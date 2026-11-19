@@ -388,14 +388,26 @@ class Service(object):
                      desired_hash: str = Body(embed=True), base_hash: str = Body(embed=True),
                      routing: dict = Body(None, embed=True)):
         import routing_sync
+        lock_wait_started = time.monotonic()
         with xray_hot_reload.core_lock:
+            lock_wait_ms = (time.monotonic() - lock_wait_started) * 1000
             self.match_session_id(session_id)
             if not XRAY_HOT_RELOAD_ENABLED:
                 raise HTTPException(403, "Hot reload is disabled")
+            stage = "apply" if routing is not None else "check"
             try:
                 result = routing_sync.sync(self.core, desired_hash, base_hash, routing)
             except (ValueError, xray_hot_reload.HotReloadError) as exc:
+                logger.warning(
+                    "Routing sync stage=%s outcome=%s lock_wait_ms=%.1f",
+                    stage, "apply_failed" if isinstance(exc, xray_hot_reload.HotReloadError) else "rejected",
+                    lock_wait_ms,
+                )
                 raise HTTPException(409, str(exc))
+            if result["needs_config"]:
+                logger.info("Routing sync stage=%s outcome=needs_config lock_wait_ms=%.1f", stage, lock_wait_ms)
+            else:
+                logger.debug("Routing sync stage=%s outcome=hash_acknowledged lock_wait_ms=%.1f", stage, lock_wait_ms)
             return self.response(**result)
 
     def add_outbound(self, session_id: UUID = Body(embed=True), outbound: dict = Body(embed=True)):

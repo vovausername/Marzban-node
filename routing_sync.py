@@ -3,6 +3,9 @@ from copy import deepcopy
 import hashlib
 import json
 import re
+import time
+
+from logger import logger
 
 PREFIX = "marzban-squad-"
 
@@ -52,9 +55,25 @@ def sync(core, desired_hash, base_hash, routing=None):
         if not service:
             raise ValueError("API routing rule is missing")
         new['rules'] = service + new['rules']
-        hot._run_xray_api(['adrules', 'stdin:'], payload=json.dumps({'routing': new}), timeout=15,
-                          assets_path=getattr(core, 'assets_path', None))
+        payload = json.dumps({'routing': new})
+        timeout = 15
+        started = time.monotonic()
+        try:
+            hot._run_xray_api(['adrules', 'stdin:'], payload=payload, timeout=timeout,
+                              assets_path=getattr(core, 'assets_path', None))
+        except hot.HotReloadError as exc:
+            # CLI errors can include configuration contents. Log only the gRPC status.
+            grpc_status = re.search(r"rpc error: code = ([A-Za-z]+) desc =", str(exc))
+            logger.warning(
+                "Xray adrules outcome=failed duration_ms=%.1f timeout_s=%d grpc_status=%s rules=%d",
+                (time.monotonic() - started) * 1000, timeout,
+                grpc_status.group(1) if grpc_status else "unavailable", len(new['rules']),
+            )
+            raise
+        duration_ms = (time.monotonic() - started) * 1000
         # Commit tracked state ONLY after Xray accepts it, under the same lock
         # used by start/restart/update-xray and user reconciliation.
         core.config['routing'] = new
+        logger.info("Xray adrules outcome=applied duration_ms=%.1f timeout_s=%d rules=%d",
+                    duration_ms, timeout, len(new['rules']))
         return {"applied_hash": desired_hash, "needs_config": False}
