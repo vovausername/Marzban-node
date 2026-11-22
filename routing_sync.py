@@ -6,7 +6,7 @@ import re
 import time
 
 from logger import logger
-from routing_assets import with_cached_matchers
+from routing_assets import prepare_routing
 
 PREFIX = "marzban-squad-"
 
@@ -70,13 +70,7 @@ def sync(core, desired_hash, base_hash, routing=None, *, observed_hash=None):
             raise ValueError("API routing rule is missing")
         new['rules'] = service + new['rules']
         assets_path = getattr(core, 'assets_path', None)
-        wire_routing = new
-        if assets_path:
-            try:
-                wire_routing = with_cached_matchers(new, assets_path)
-            except (OSError, UnicodeError) as exc:
-                logger.warning("Could not generate routing assets (%s); using inline matchers", type(exc).__name__)
-        payload = json.dumps({'routing': wire_routing})
+        payload = json.dumps({'routing': prepare_routing(new, assets_path)})
         timeout = 15
         started = time.monotonic()
         try:
