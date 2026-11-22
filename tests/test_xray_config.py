@@ -89,3 +89,30 @@ def test_to_json_round_trips():
     config = xray.XRayConfig(_config(), peer_ip="203.0.113.5")
     round_tripped = json.loads(config.to_json())
     assert round_tripped["api"]["tag"] == "API"
+
+
+def test_start_warms_routing_assets_without_mutating_config(monkeypatch, tmp_path):
+    from unittest.mock import Mock
+
+    core = object.__new__(xray.XRayCore)
+    core.process = None
+    core.version = "26.11.9"
+    core.assets_path = str(tmp_path)
+    core.executable_path = "/bin/true"
+    core._env = {"XRAY_LOCATION_ASSET": core.assets_path}
+    core._on_start_funcs = []
+    monkeypatch.setattr(xray, "XRAY_HOT_RELOAD_ENABLED", True)
+    monkeypatch.setattr(core, "_XRayCore__capture_process_logs", Mock())
+    process = Mock()
+    monkeypatch.setattr(xray.subprocess, "Popen", Mock(return_value=process))
+    config = xray.XRayConfig(_config(routing={"rules": [
+        {"type": "field", "domain": ["full:example.org"], "ip": ["192.0.2.0/24"], "outboundTag": "direct"},
+    ]}), "127.0.0.1")
+    original = config.to_json()
+
+    core.start(config)
+
+    wire = json.loads(process.stdin.write.call_args.args[0])
+    assert config.to_json() == original
+    assert wire["routing"] == xray.prepare_routing(config["routing"], core.assets_path)
+    assert len(list(tmp_path.glob("marzban-routing-*.dat"))) == 2
