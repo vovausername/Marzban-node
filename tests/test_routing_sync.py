@@ -120,6 +120,21 @@ class RoutingSyncTest(unittest.TestCase):
                 self.assertTrue((Path(directory) / name).is_file())
             self.assertEqual(len(list(Path(directory).glob('*.dat'))), 2)
 
+    def test_generated_assets_restore_corrupted_file(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        self.desired['rules'][0]['domain'] = ['full:example.com']
+        with TemporaryDirectory() as directory:
+            prepared = rs.prepare_routing(self.desired, directory)
+            asset = next(Path(directory).glob('*.dat'))
+            expected = asset.read_bytes()
+            asset.write_bytes(b"corrupt")
+
+            self.assertEqual(rs.prepare_routing(self.desired, directory), prepared)
+            self.assertEqual(asset.read_bytes(), expected)
+            self.assertEqual(list(Path(directory).iterdir()), [asset])
+
     def test_generated_assets_fall_back_on_write_failure(self):
         import json
 
