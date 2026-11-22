@@ -167,7 +167,7 @@ class Service(object):
             pass
         import routing_sync
         if XRAY_HOT_RELOAD_ENABLED and routing_sync.supported(getattr(self.core, "version", None)):
-            features.append("sync-routing")
+            features.extend(("sync-routing", "repair-routing-base"))
         return features
 
     def response(self, **kwargs):
@@ -386,7 +386,9 @@ class Service(object):
 
     def sync_routing(self, session_id: UUID = Body(embed=True),
                      desired_hash: str = Body(embed=True), base_hash: str = Body(embed=True),
-                     routing: dict = Body(None, embed=True)):
+                     routing: dict = Body(None, embed=True),
+                     allow_base_repair: bool = Body(False, embed=True),
+                     observed_hash: str = Body(None, embed=True)):
         import routing_sync
         lock_wait_started = time.monotonic()
         with xray_hot_reload.core_lock:
@@ -396,14 +398,23 @@ class Service(object):
                 raise HTTPException(403, "Hot reload is disabled")
             stage = "apply" if routing is not None else "check"
             try:
-                result = routing_sync.sync(self.core, desired_hash, base_hash, routing)
+                result = routing_sync.sync(self.core, desired_hash, base_hash, routing,
+                                           observed_hash=observed_hash)
             except (ValueError, xray_hot_reload.HotReloadError) as exc:
                 logger.warning(
                     "Routing sync stage=%s outcome=%s lock_wait_ms=%.1f",
                     stage, "apply_failed" if isinstance(exc, xray_hot_reload.HotReloadError) else "rejected",
                     lock_wait_ms,
                 )
-                raise HTTPException(409, str(exc))
+                detail = str(exc)
+                if allow_base_repair and routing is None and isinstance(exc, routing_sync.BaseRoutingMismatch):
+                    detail = {
+                        "code": "base_routing_mismatch",
+                        "current_base_hash": exc.current_base_hash,
+                        "expected_base_hash": base_hash,
+                        "observed_hash": exc.observed_hash,
+                    }
+                raise HTTPException(409, detail) from exc
             if result["needs_config"]:
                 logger.info("Routing sync stage=%s outcome=needs_config lock_wait_ms=%.1f", stage, lock_wait_ms)
             else:

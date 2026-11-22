@@ -10,6 +10,13 @@ from logger import logger
 PREFIX = "marzban-squad-"
 
 
+class BaseRoutingMismatch(ValueError):
+    def __init__(self, current_base_hash, observed_hash):
+        super().__init__("Base routing differs from panel; apply the base core config first")
+        self.current_base_hash = current_base_hash
+        self.observed_hash = observed_hash
+
+
 def supported(version):
     match = re.search(r"(\d+)\.(\d+)\.(\d+)", str(version))
     return bool(match and tuple(map(int, match.groups())) >= (26, 9, 9))
@@ -26,7 +33,7 @@ def normalize(routing, strip_managed=False):
     return value
 
 
-def sync(core, desired_hash, base_hash, routing=None):
+def sync(core, desired_hash, base_hash, routing=None, *, observed_hash=None):
     import xray_hot_reload as hot
     with hot.core_lock:
         if not supported(core.version):
@@ -34,15 +41,21 @@ def sync(core, desired_hash, base_hash, routing=None):
         if not core.started or not core.config:
             raise ValueError("Xray is not running")
         current = core.config.get("routing", {})
-        if digest(normalize(current, True)) != base_hash:
-            raise ValueError("Base routing differs from panel; apply the base core config first")
-        if digest(normalize(current)) == desired_hash:
+        current_hash = digest(normalize(current))
+        if observed_hash is not None and current_hash != observed_hash:
+            raise ValueError("Routing changed since the sync check; retry synchronization")
+        current_base_hash = digest(normalize(current, True))
+        if current_base_hash != base_hash and observed_hash is None:
+            raise BaseRoutingMismatch(current_base_hash, current_hash)
+        if routing is None and current_hash == desired_hash:
             return {"applied_hash": desired_hash, "needs_config": False}
         if routing is None:
             return {"needs_config": True}
         new = normalize(routing)
         if digest(new) != desired_hash or digest(normalize(new, True)) != base_hash:
             raise ValueError("Routing payload hash mismatch")
+        if current_hash == desired_hash:
+            return {"applied_hash": desired_hash, "needs_config": False}
         if {k: v for k, v in new.items() if k not in ('rules', 'balancers')} != {
             k: v for k, v in current.items() if k not in ('rules', 'balancers')
         }:

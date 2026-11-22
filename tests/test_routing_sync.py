@@ -46,6 +46,48 @@ class RoutingSyncTest(unittest.TestCase):
                 rs.sync(self.core, self.hash, 'wrong', self.desired)
             run.assert_not_called()
 
+    def test_repairs_stale_base_with_already_loaded_outbound(self):
+        self.core.config['outbounds'].append({'tag': 'ai-usa'})
+        new_routing = {'rules': [
+            {'ruleTag': 'marzban-squad-2-rule-1', 'user': ['1.alice'], 'outboundTag': 'ai-usa'},
+            {'ruleTag': 'marzban-squad-1-rule-1', 'user': ['1.alice'], 'outboundTag': 'special'},
+            dict(self.base['rules'][1], ruleTag='updated'),
+        ]}
+        base_hash = rs.digest(rs.normalize(new_routing, True))
+        desired_hash = rs.digest(new_routing)
+        with patch.object(hot, '_run_xray_api') as run:
+            from fastapi import HTTPException
+            from rest_service import Service
+            service = NS(core=self.core, match_session_id=lambda _: None)
+            with patch('rest_service.XRAY_HOT_RELOAD_ENABLED', True):
+                with self.assertRaises(HTTPException) as caught:
+                    Service.sync_routing(service, 'session', desired_hash, base_hash,
+                                         routing=None, allow_base_repair=True, observed_hash=None)
+                self.assertEqual(caught.exception.status_code, 409)
+                detail = caught.exception.detail
+                self.assertEqual(detail['code'], 'base_routing_mismatch')
+                self.assertEqual(detail['current_base_hash'], self.base_hash)
+                self.assertEqual(detail['expected_base_hash'], base_hash)
+                run.assert_not_called()
+                result = rs.sync(self.core, desired_hash, base_hash, new_routing,
+                                 observed_hash=detail['observed_hash'])
+            run.assert_called_once()
+        self.assertEqual(result['applied_hash'], desired_hash)
+        self.assertEqual(self.core.config['routing']['rules'], [self.base['rules'][0]] + new_routing['rules'])
+
+    def test_repair_rejects_changed_routing_and_unsupported_fields(self):
+        new_routing = dict(self.desired, domainStrategy='IPIfNonMatch')
+        base_hash = rs.digest(rs.normalize(new_routing, True))
+        desired_hash = rs.digest(new_routing)
+        observed_hash = rs.digest(rs.normalize(self.core.config['routing']))
+        with patch.object(hot, '_run_xray_api') as run:
+            with self.assertRaisesRegex(ValueError, 'Only rules and balancers'):
+                rs.sync(self.core, desired_hash, base_hash, new_routing, observed_hash=observed_hash)
+            self.core.config['routing']['rules'].extend(self.desired['rules'][:1])
+            with self.assertRaisesRegex(ValueError, 'Routing changed since'):
+                rs.sync(self.core, desired_hash, base_hash, new_routing, observed_hash=observed_hash)
+            run.assert_not_called()
+
     def test_payload_tampering_and_unknown_outbound(self):
         with patch.object(hot, '_run_xray_api') as run:
             with self.assertRaises(ValueError):
