@@ -6,6 +6,7 @@ import re
 import time
 
 from logger import logger
+from routing_assets import with_cached_matchers
 
 PREFIX = "marzban-squad-"
 
@@ -68,12 +69,19 @@ def sync(core, desired_hash, base_hash, routing=None, *, observed_hash=None):
         if not service:
             raise ValueError("API routing rule is missing")
         new['rules'] = service + new['rules']
-        payload = json.dumps({'routing': new})
+        assets_path = getattr(core, 'assets_path', None)
+        wire_routing = new
+        if assets_path:
+            try:
+                wire_routing = with_cached_matchers(new, assets_path)
+            except (OSError, UnicodeError) as exc:
+                logger.warning("Could not generate routing assets (%s); using inline matchers", type(exc).__name__)
+        payload = json.dumps({'routing': wire_routing})
         timeout = 15
         started = time.monotonic()
         try:
             hot._run_xray_api(['adrules', 'stdin:'], payload=payload, timeout=timeout,
-                              assets_path=getattr(core, 'assets_path', None))
+                              assets_path=assets_path)
         except hot.HotReloadError as exc:
             # CLI errors can include configuration contents. Log only the gRPC status.
             grpc_status = re.search(r"rpc error: code = ([A-Za-z]+) desc =", str(exc))

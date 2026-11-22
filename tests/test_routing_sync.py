@@ -88,6 +88,47 @@ class RoutingSyncTest(unittest.TestCase):
                 rs.sync(self.core, desired_hash, base_hash, new_routing, observed_hash=observed_hash)
             run.assert_not_called()
 
+    def test_generated_assets_are_reused_without_changing_tracked_routing(self):
+        import json
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        desired = deepcopy(self.desired)
+        desired['rules'][0].update(domain=['full:example.com', 'example.net'], ip=['192.0.2.0/24'])
+        desired['rules'][1] = dict(desired['rules'][1], domain=['geosite:private'])
+        self.core.config['routing']['rules'][1] = deepcopy(desired['rules'][1])
+        base_hash = rs.digest(rs.normalize(self.core.config['routing'], True))
+
+        with TemporaryDirectory() as directory, patch.object(hot, '_run_xray_api') as run:
+            self.core.assets_path = directory
+            for user in ('fixture-6', 'fixture-7'):
+                desired['rules'][0]['user'] = [user]
+                digest = rs.digest(desired)
+                self.assertEqual(rs.sync(self.core, digest, base_hash, desired)['applied_hash'], digest)
+                payload = json.loads(run.call_args.kwargs['payload'])['routing']
+                self.assertEqual(payload['rules'][1]['user'], [user])
+                self.assertEqual(payload['rules'][2]['domain'], ['geosite:private'])
+                self.assertEqual(rs.normalize(self.core.config['routing']), desired)
+                self.assertFalse(rs.sync(self.core, digest, base_hash)['needs_config'])
+
+            first, second = [json.loads(call.kwargs['payload'])['routing']['rules'][1]
+                             for call in run.call_args_list]
+            for key in ('domain', 'ip'):
+                self.assertEqual(first[key], second[key])
+                prefix, name, code = first[key][0].split(':')
+                self.assertEqual((prefix, code), ('ext', 'MARZBAN'))
+                self.assertTrue((Path(directory) / name).is_file())
+            self.assertEqual(len(list(Path(directory).glob('*.dat'))), 2)
+
+    def test_generated_assets_fall_back_on_write_failure(self):
+        import json
+
+        self.desired['rules'][0]['domain'] = ['full:example.com']
+        self.core.assets_path = '/dev/null'
+        with patch.object(hot, '_run_xray_api') as run:
+            rs.sync(self.core, rs.digest(self.desired), self.base_hash, self.desired)
+        self.assertEqual(rs.normalize(json.loads(run.call_args.kwargs['payload'])['routing']), self.desired)
+
     def test_payload_tampering_and_unknown_outbound(self):
         with patch.object(hot, '_run_xray_api') as run:
             with self.assertRaises(ValueError):
