@@ -115,4 +115,7 @@ def test_start_warms_routing_assets_without_mutating_config(monkeypatch, tmp_pat
     wire = json.loads(process.stdin.write.call_args.args[0])
     assert config.to_json() == original
     assert wire["routing"] == xray.prepare_routing(config["routing"], core.assets_path)
-    assert len(list(tmp_path.glob("marzban-routing-*.dat"))) == 2
+    api_rule, inline_api_rule = wire["routing"]["rules"][0], config["routing"]["rules"][0]
+    assert api_rule["source"][0].startswith("ext:marzban-routing-ip-")
+    assert {**api_rule, "source": inline_api_rule["source"]} == inline_api_rule
+    assert len(list(tmp_path.glob("marzban-routing-*.dat"))) == 3

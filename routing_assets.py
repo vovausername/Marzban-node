@@ -93,9 +93,6 @@ def with_cached_matchers(routing, assets_path):
     directory = Path(assets_path)
     rules = []
     for source in routing.get("rules", []):
-        if source.get("outboundTag") == "API":
-            rules.append(source)
-            continue
         rule = dict(source)
         for field, kind, encode in (
             ("domain", "site", _site_asset),
@@ -105,6 +102,8 @@ def with_cached_matchers(routing, assets_path):
             ("sourceIP", "ip", _ip_asset),
             ("localIP", "ip", _ip_asset),
         ):
+            if source.get("outboundTag") == "API" and field not in ("source", "sourceIP"):
+                continue
             values = rule.get(field)
             if isinstance(values, list) and values and all(isinstance(value, str) for value in values):
                 asset = encode(values)
