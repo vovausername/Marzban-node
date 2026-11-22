@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
+from logger import logger
+
 
 _CODE = b"MARZBAN"
 _DOMAIN_TYPES = {"keyword": 0, "domain": 2, "full": 3}
@@ -67,16 +69,23 @@ def _ip_asset(values):
 def _publish_asset(directory, kind, content):
     filename = f"marzban-routing-{kind}-{hashlib.sha256(content).hexdigest()}.dat"
     path = directory / filename
-    if not path.is_file():
-        with NamedTemporaryFile(dir=directory, delete=False) as temporary:
-            temp_path = Path(temporary.name)
-            try:
-                temporary.write(content)
-                temporary.close()
-                os.replace(temp_path, path)
-            finally:
-                temp_path.unlink(missing_ok=True)
-    return f"ext:{filename}:{_CODE.decode()}"
+    reference = f"ext:{filename}:{_CODE.decode()}"
+    try:
+        with path.open("rb") as existing:
+            if existing.read(len(content) + 1) == content:
+                return reference
+    except FileNotFoundError:
+        pass
+
+    with NamedTemporaryFile(dir=directory, delete=False) as temporary:
+        temp_path = Path(temporary.name)
+        try:
+            temporary.write(content)
+            temporary.close()
+            os.replace(temp_path, path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+    return reference
 
 
 def with_cached_matchers(routing, assets_path):
@@ -84,6 +93,9 @@ def with_cached_matchers(routing, assets_path):
     directory = Path(assets_path)
     rules = []
     for source in routing.get("rules", []):
+        if source.get("outboundTag") == "API":
+            rules.append(source)
+            continue
         rule = dict(source)
         for field, kind, encode in (
             ("domain", "site", _site_asset),
@@ -100,3 +112,14 @@ def with_cached_matchers(routing, assets_path):
                     rule[field] = [_publish_asset(directory, kind, asset)]
         rules.append(rule)
     return {**routing, "rules": rules}
+
+
+def prepare_routing(routing, assets_path):
+    """Use inline conditions if the assets directory cannot be used."""
+    if not assets_path or not routing.get("rules"):
+        return routing
+    try:
+        return with_cached_matchers(routing, assets_path)
+    except (OSError, UnicodeError) as exc:
+        logger.warning("Could not generate routing assets (%s); using inline matchers", type(exc).__name__)
+        return routing
