@@ -12,6 +12,8 @@ from config import (DEBUG, SSL_CERT_FILE, SSL_KEY_FILE, XRAY_API_HOST,
                     XRAY_LOCAL_API_PORT, XRAY_START_CONFIRM_SECONDS,
                     XRAY_START_POLL_INTERVAL, INBOUNDS)
 from logger import logger
+from routing_assets import prepare_routing
+from routing_sync import supported as supports_routing_sync
 
 
 def get_xray_version(executable_path: str):
@@ -244,6 +246,11 @@ class XRayCore:
         if config.get('log', {}).get('logLevel') in ('none', 'error'):
             config['log']['logLevel'] = 'warning'
 
+        wire_config = config
+        if XRAY_HOT_RELOAD_ENABLED and supports_routing_sync(self.version) and "routing" in config:
+            wire_config = {**config, "routing": prepare_routing(config["routing"], self.assets_path)}
+        payload = json.dumps(wire_config)
+
         cmd = [
             self.executable_path,
             "run",
@@ -258,7 +265,7 @@ class XRayCore:
             stdout=subprocess.PIPE,
             universal_newlines=True
         )
-        self.process.stdin.write(config.to_json())
+        self.process.stdin.write(payload)
         self.process.stdin.flush()
         self.process.stdin.close()
 
