@@ -158,7 +158,7 @@ class Service(object):
           are usable right now (hot reload on, Xray CLI new enough). Both
           take allow_pending and answer with pending_users.
         """
-        features = ["keep-core", "ping-status", "gzip"]
+        features = ["keep-core", "ping-status", "gzip", "xray-repository"]
         try:
             if XRAY_HOT_RELOAD_ENABLED and xray_hot_reload._cli_supports_user_ops(
                     getattr(self.core, "version", None)):
@@ -485,7 +485,7 @@ class Service(object):
             raise HTTPException(status_code=500, detail=str(exc))
         return self.response(**stats)
 
-    def update_xray(self, session_id: UUID = Body(embed=True), version: str = Body(embed=True)):
+    def update_xray(self, session_id: UUID = Body(embed=True), version: str = Body(embed=True), repository: str = Body("https://github.com/XTLS/Xray-core", embed=True)):
         self.match_session_id(session_id)
         if not XRAY_REMOTE_UPDATE_ENABLED:
             raise HTTPException(
@@ -499,7 +499,7 @@ class Service(object):
         # for the same duration, even though none of them touch anything
         # this step reads or writes.
         try:
-            prepared = xray_updater.fetch_and_verify(version)
+            prepared = xray_updater.fetch_and_verify(version, repository)
         except xray_updater.XrayUpdateError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 

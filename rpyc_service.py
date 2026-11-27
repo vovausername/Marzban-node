@@ -236,7 +236,7 @@ class XrayService(rpyc.Service):
                 raise ValueError(str(exc))
 
     @rpyc.exposed
-    def update_xray(self, version: str) -> dict:
+    def update_xray(self, version: str, repository: str = "https://github.com/XTLS/Xray-core") -> dict:
         if not XRAY_REMOTE_UPDATE_ENABLED:
             raise PermissionError(
                 "Remote Xray updates are disabled. Set XRAY_REMOTE_UPDATE_ENABLED=true to allow them."
@@ -251,7 +251,7 @@ class XrayService(rpyc.Service):
         # for the same duration, even though none of them touch anything
         # this step reads or writes.
         try:
-            prepared = xray_updater.fetch_and_verify(version)
+            prepared = xray_updater.fetch_and_verify(version, repository)
         except xray_updater.XrayUpdateError as exc:
             raise ValueError(str(exc))
 

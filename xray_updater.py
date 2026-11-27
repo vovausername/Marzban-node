@@ -5,6 +5,9 @@ config that was applied on this connection.
 No new dependency: uses urllib from the standard library instead of
 requests, consistent with the rest of this minimal-footprint project.
 """
+import re
+import json
+import urllib.parse
 import hashlib
 import os
 import platform
@@ -21,7 +24,6 @@ from config import XRAY_EXECUTABLE_PATH, XRAY_EXECUTABLE_SEEDED_MARKER
 from logger import logger
 from xray import wait_until_ready
 
-_RELEASES_BASE = "https://github.com/XTLS/Xray-core/releases/download"
 _ARCH_MAP = {
     "x86_64": "64",
     "amd64": "64",
@@ -47,10 +49,38 @@ def _xray_asset_name() -> str:
 
 
 def _validate_version(version: str) -> str:
-    version = (version or "").strip().lstrip("v")
-    if not version or not all(part.isdigit() for part in version.split(".")):
-        raise XrayUpdateError(f"Invalid version string: {version!r}")
+    version = (version or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", version):
+        raise XrayUpdateError(f"Invalid release tag: {version!r}")
     return version
+
+
+class ReleaseNotFound(XrayUpdateError):
+    pass
+
+
+def _release(repository: str, tag: str) -> dict:
+    api = repository.replace("https://github.com/", "https://api.github.com/repos/", 1)
+    try:
+        return json.loads(_fetch(f"{api}/releases/tags/{urllib.parse.quote(tag, safe='')}"))
+    except ReleaseNotFound:
+        # Retain manual numeric-version input for official releases.
+        if re.fullmatch(r"\d+(?:\.\d+)+", tag):
+            return json.loads(_fetch(f"{api}/releases/tags/v{tag}"))
+        raise
+
+
+def _release_asset(release: dict) -> tuple[str, bool, str]:
+    names = {asset["name"] for asset in release.get("assets", [])}
+    archive = _xray_asset_name()
+    if archive in names and archive + ".dgst" in names:
+        return archive, True, archive + ".dgst"
+    machine = platform.machine().lower()
+    arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(machine)
+    binary = f"xray-linux-{arch}"
+    if arch and binary in names and "sha256sums.txt" in names:
+        return binary, False, "sha256sums.txt"
+    raise XrayUpdateError("Release has no supported binary and checksum for this architecture")
 
 
 _FETCH_TIMEOUT = 120
@@ -65,7 +95,7 @@ def _fetch(url: str) -> bytes:
                 return resp.read()
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
-                raise XrayUpdateError(f"Not found: {url} (does this Xray version/asset exist?)")
+                raise ReleaseNotFound(f"Not found: {url} (does this Xray version/asset exist?)")
             if exc.code < 500:
                 raise XrayUpdateError(f"Failed to fetch {url}: HTTP {exc.code}")
             last_error = f"HTTP {exc.code}"
@@ -86,9 +116,13 @@ def _verify_checksum(asset_bytes: bytes, dgst_text: str, asset_name: str) -> Non
     # "SHA2-256= <hex>". Accept SHA256/SHA2-256 spellings, case-insensitive.
     expected = None
     for line in dgst_text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].lstrip("*") == asset_name and re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
+            expected = parts[0].lower()
+            break
         key, _, value = line.partition("=")
         if key.strip().upper().replace("-", "") in ("SHA256", "SHA2256"):
-            expected = value.strip().split()[0].lower()
+            expected = value.strip().lower()
             break
     if not expected:
         raise XrayUpdateError("Could not find a SHA256 entry in the release .dgst file")
@@ -116,7 +150,7 @@ class PreparedUpdate:
         self._tmp_dir.cleanup()
 
 
-def fetch_and_verify(version: str) -> PreparedUpdate:
+def fetch_and_verify(version: str, repository: str = "https://github.com/XTLS/Xray-core") -> PreparedUpdate:
     """Download Xray `version`, verify its checksum, and confirm the
     extracted binary actually runs — entirely independent of any running
     core. Deliberately separate from apply(): this step is pure network
@@ -130,12 +164,19 @@ def fetch_and_verify(version: str) -> PreparedUpdate:
     pass to apply().
     """
     version = _validate_version(version)
-    asset_name = _xray_asset_name()
-    base_url = f"{_RELEASES_BASE}/v{version}"
+    repository = repository.strip().rstrip("/")
+    if repository.endswith(".git"):
+        repository = repository[:-4]
+    if not re.fullmatch(r"https://github\.com/[A-Za-z0-9][A-Za-z0-9_-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*", repository):
+        raise XrayUpdateError("Expected a GitHub repository URL: https://github.com/owner/repo")
+    release = _release(repository, version)
+    tag = _validate_version(release["tag_name"])
+    asset_name, is_archive, checksum_name = _release_asset(release)
+    base_url = f"{repository}/releases/download/{urllib.parse.quote(tag, safe='')}"
 
     logger.info(f"Downloading Xray {version} ({asset_name})...")
     asset_bytes = _fetch(f"{base_url}/{asset_name}")
-    dgst_text = _fetch(f"{base_url}/{asset_name}.dgst").decode()
+    dgst_text = _fetch(f"{base_url}/{checksum_name}").decode()
     _verify_checksum(asset_bytes, dgst_text, asset_name)
 
     # Stage the download in the SAME directory (and therefore filesystem)
@@ -156,10 +197,12 @@ def fetch_and_verify(version: str) -> PreparedUpdate:
         with open(zip_path, "wb") as f:
             f.write(asset_bytes)
 
-        with zipfile.ZipFile(zip_path) as zf:
-            zf.extract("xray", tmp_dir.name)
-
         binary_path = os.path.join(tmp_dir.name, "xray")
+        if is_archive:
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extract("xray", tmp_dir.name)
+        else:
+            os.replace(zip_path, binary_path)
         os.chmod(binary_path, os.stat(binary_path).st_mode | stat.S_IEXEC)
 
         # Sanity-check the new binary actually runs before touching the live one.
@@ -169,7 +212,9 @@ def fetch_and_verify(version: str) -> PreparedUpdate:
             ).decode()
         except Exception as exc:
             raise XrayUpdateError(f"Downloaded binary failed to run: {exc}")
-        if version not in output:
+        reported = re.match(r"^Xray (\d+\.\d+\.\d+)(?:\s|[-+])", output)
+        tag_version = re.match(r"^v?(\d+\.\d+\.\d+)(?:$|[-+])", tag)
+        if not reported or (tag_version and reported[1] != tag_version[1]):
             raise XrayUpdateError(
                 f"Downloaded binary reports unexpected version (wanted {version}): {output.strip()}"
             )
