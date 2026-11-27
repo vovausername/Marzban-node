@@ -85,7 +85,7 @@ def test_base_reports_connected_started_and_version(client, svc):
     assert data == {
         "connected": False, "started": False, "core_version": "test-version",
         # No real Xray binary in tests, so "sync-users" is not advertised.
-        "features": ["keep-core", "ping-status", "gzip"],
+        "features": ["keep-core", "ping-status", "gzip", "xray-repository"],
     }
 
 
