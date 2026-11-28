@@ -1,6 +1,7 @@
 import os
 import shutil
 import stat
+import xray_source
 
 from decouple import config
 from dotenv import load_dotenv
@@ -51,6 +52,7 @@ def _install_baked_xray_binary() -> None:
     st = os.stat(tmp_path)
     os.chmod(tmp_path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     os.replace(tmp_path, XRAY_EXECUTABLE_PATH)
+    xray_source.record_source(XRAY_EXECUTABLE_PATH, "https://github.com/XTLS/Xray-core")
     with open(XRAY_EXECUTABLE_SEEDED_MARKER, "w"):
         pass
 

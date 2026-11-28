@@ -10,6 +10,8 @@ import socket
 import time
 
 from logger import logger
+from config import XRAY_EXECUTABLE_PATH
+from xray_source import read_source
 
 
 def _read_meminfo() -> dict:
@@ -48,7 +50,10 @@ def _read_net_dev() -> dict:
 
 
 def get_system_stats(net_sample_interval: float = 0.5) -> dict:
+    source = read_source(XRAY_EXECUTABLE_PATH) or {}
     stats = {
+        "xray_repository": source.get("repository"),
+        "xray_release_tag": source.get("tag"),
         "hostname": socket.gethostname(),
         "cpu_count": os.cpu_count(),
         "loadavg": None,
