@@ -84,3 +84,24 @@ class RepositoryTests(unittest.TestCase):
         for tag in ['../foo', 'v1/../../x', 'tag?x=1', '']:
             with self.assertRaises(self.ns['XrayUpdateError']):
                 self.ns['_validate_version'](tag)
+
+    def test_successful_install_records_source(self):
+        import tempfile
+        from types import SimpleNamespace
+        import xray_source
+        with tempfile.TemporaryDirectory() as directory:
+            live = Path(directory) / 'xray'
+            staged = Path(directory) / 'new'
+            live.write_bytes(b'old')
+            staged.write_bytes(b'new')
+            self.ns['XRAY_EXECUTABLE_PATH'] = str(live)
+            self.ns['XRAY_EXECUTABLE_SEEDED_MARKER'] = str(live) + '.seeded'
+            prepared = SimpleNamespace(version='v26.11.9-h2Flow-7', binary_path=str(staged),
+                                       repository='https://github.com/Medium1992/Xray-core-fork',
+                                       tag='v26.11.9-h2Flow-7', cleanup=Mock())
+            core = Mock(version='26.1.1', started=False)
+            core.get_version.return_value = '26.11.9'
+            self.ns['apply'](prepared, core)
+            self.assertEqual(xray_source.read_source(str(live)), {
+                'repository': prepared.repository, 'tag': prepared.tag})
+            prepared.cleanup.assert_called_once()

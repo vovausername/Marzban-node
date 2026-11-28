@@ -19,6 +19,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+import xray_source
 
 from config import XRAY_EXECUTABLE_PATH, XRAY_EXECUTABLE_SEEDED_MARKER
 from logger import logger
@@ -141,7 +142,9 @@ class PreparedUpdate:
     caller decides not to proceed after fetch_and_verify() succeeds),
     call .cleanup() explicitly to remove the temp directory."""
 
-    def __init__(self, version: str, tmp_dir: tempfile.TemporaryDirectory, binary_path: str):
+    def __init__(self, version: str, tmp_dir: tempfile.TemporaryDirectory, binary_path: str, repository: str | None = None, tag: str | None = None):
+        self.repository = repository
+        self.tag = tag
         self.version = version
         self._tmp_dir = tmp_dir
         self.binary_path = binary_path
@@ -222,7 +225,7 @@ def fetch_and_verify(version: str, repository: str = "https://github.com/XTLS/Xr
         tmp_dir.cleanup()
         raise
 
-    return PreparedUpdate(version, tmp_dir, binary_path)
+    return PreparedUpdate(version, tmp_dir, binary_path, repository, tag)
 
 
 def _tail_logs(core, n: int = 20) -> str:
@@ -340,6 +343,12 @@ def apply(prepared: PreparedUpdate, core) -> dict:
             os.remove(XRAY_EXECUTABLE_SEEDED_MARKER)
         except OSError:
             pass
+
+    if prepared.repository:
+        try:
+            xray_source.record_source(XRAY_EXECUTABLE_PATH, prepared.repository, prepared.tag)
+        except OSError as exc:
+            logger.warning(f"Could not save Xray source metadata: {exc}")
 
     logger.warning(f"Xray updated: {previous_version} -> {core.version}")
     return {"previous_version": previous_version, "new_version": core.version}
